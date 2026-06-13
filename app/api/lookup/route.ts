@@ -20,7 +20,8 @@ async function verifyTurnstile(token: string, ip: string): Promise<boolean> {
   return data.success === true
 }
 
-async function callOrthogonal(api: string, path: string, params: Record<string, string>) {
+// Orthogonal wraps all responses: { success, data: <provider response>, payment, ... }
+async function callOrthogonal(api: string, path: string, params: Record<string, unknown>) {
   const res = await fetch(ORTHOGONAL_URL, {
     method: 'POST',
     headers: {
@@ -30,32 +31,42 @@ async function callOrthogonal(api: string, path: string, params: Record<string, 
     body: JSON.stringify({ api, path, params }),
   })
   if (!res.ok) return null
-  return res.json()
+  const json = await res.json()
+  // Unwrap the Orthogonal envelope — actual provider response is in json.data
+  return json?.data ?? json
 }
 
+// Step 1: Tomba — $0.01. Response: { data: { email } }
 async function tryTomba(linkedinUrl: string): Promise<string | null> {
   const data = await callOrthogonal('tomba', '/v1/linkedin', { url: linkedinUrl })
   if (!data) return null
-  return (
-    data?.data?.email ||
-    data?.result?.email ||
-    data?.email ||
-    null
-  )
+  const email = data?.data?.email ?? data?.email ?? null
+  return email || null
 }
 
+// Step 2: Apollo — $0.01. Response: { person: { email, email_status } }
 async function tryApollo(linkedinUrl: string): Promise<string | null> {
   const data = await callOrthogonal('apollo', '/api/v1/people/match', {
     linkedin_url: linkedinUrl,
-    reveal_personal_emails: 'false',
+    reveal_personal_emails: false,
   })
   if (!data) return null
-  return (
-    data?.person?.email ||
-    data?.result?.email ||
-    data?.email ||
-    null
-  )
+  const email = data?.person?.email ?? null
+  return email || null
+}
+
+// Step 3: ContactOut — $0.33. Response: { profile: { work_email: [], email: [] } }
+// Prefers verified work email, falls back to any email found.
+async function tryContactOut(linkedinUrl: string): Promise<string | null> {
+  const data = await callOrthogonal('contactout', '/v1/people/linkedin', {
+    profile: linkedinUrl,
+  })
+  if (!data) return null
+  const profile = data?.profile
+  if (!profile) return null
+  const workEmail = Array.isArray(profile.work_email) ? profile.work_email[0] : null
+  const anyEmail = Array.isArray(profile.email) ? profile.email[0] : null
+  return workEmail ?? anyEmail ?? null
 }
 
 export async function POST(request: NextRequest) {
@@ -103,14 +114,18 @@ export async function POST(request: NextRequest) {
   // 5. Log attempt
   await supabase.from('attempts').insert({ user_hash: userHash })
 
-  // 6. Tomba
+  // 6. Tomba ($0.01)
   const tombaEmail = await tryTomba(url)
   if (tombaEmail) return NextResponse.json({ email: tombaEmail })
 
-  // 7. Apollo
+  // 7. Apollo ($0.01)
   const apolloEmail = await tryApollo(url)
   if (apolloEmail) return NextResponse.json({ email: apolloEmail })
 
-  // 8. Not found
+  // 8. ContactOut ($0.33)
+  const contactOutEmail = await tryContactOut(url)
+  if (contactOutEmail) return NextResponse.json({ email: contactOutEmail })
+
+  // 9. Not found
   return NextResponse.json({ not_found: true })
 }
