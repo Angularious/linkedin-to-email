@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { createServiceClient } from '@/lib/supabase'
 import { hashIdentity } from '@/lib/hash'
 
-const ORTHOGONAL_URL = 'https://mcp.orthogonal.com'
+const ORTHOGONAL_URL = 'https://api.orthogonal.com/v1/run'
 const RATE_LIMIT = 3
 const WINDOW_HOURS = 24
 
@@ -35,7 +35,7 @@ async function callOrthogonal(api: string, path: string, params: Record<string, 
       'Content-Type': 'application/json',
       Authorization: `Bearer ${process.env.ORTHOGONAL_API_KEY}`,
     },
-    body: JSON.stringify({ api, path, params }),
+    body: JSON.stringify({ api, path, body: params }),
   })
   if (!res.ok) return null
   const json = await res.json()
