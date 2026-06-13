@@ -99,7 +99,6 @@ export default function LinkedInForm() {
       roughness: 2.8,
       strokeWidth: 2.5,
       stroke: '#111',
-      fill: 'none',
       bowing: 1.2,
     })
 
@@ -108,7 +107,6 @@ export default function LinkedInForm() {
       roughness: 1.8,
       strokeWidth: 1.6,
       stroke: '#888',
-      fill: 'none',
       bowing: 0.8,
     })
 
@@ -117,7 +115,6 @@ export default function LinkedInForm() {
       roughness: 2.5,
       strokeWidth: 3,
       stroke: '#111',
-      fill: 'none',
       bowing: 2,
     })
 
@@ -133,7 +130,6 @@ export default function LinkedInForm() {
         roughness: 2,
         strokeWidth: 2.2,
         stroke,
-        fill: 'none',
         bowing: 1.5,
       })
     }
@@ -528,7 +524,6 @@ function ModalBorder() {
         roughness: 2.8,
         strokeWidth: 2.5,
         stroke: '#111',
-        fill: 'none',
         bowing: 1.2,
       })
     })()
