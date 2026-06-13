@@ -69,7 +69,7 @@ export default function Home() {
               textUnderlineOffset: '3px',
             }}
           >
-            orthogonal
+            orthogonal.com
           </a>
         </footer>
       </div>

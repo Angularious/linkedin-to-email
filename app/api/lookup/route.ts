@@ -27,15 +27,20 @@ async function verifyTurnstile(token: string, ip: string): Promise<boolean> {
   return data.success === true
 }
 
-// Orthogonal wraps all responses: { success, data: <provider response>, payment, ... }
-async function callOrthogonal(api: string, path: string, params: Record<string, unknown>) {
+// Orthogonal REST API: GET endpoints use `query`, POST endpoints use `body`
+async function callOrthogonal(
+  api: string,
+  path: string,
+  params: Record<string, unknown>,
+  httpMethod: 'GET' | 'POST' = 'POST'
+) {
   const res = await fetch(ORTHOGONAL_URL, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${process.env.ORTHOGONAL_API_KEY}`,
     },
-    body: JSON.stringify({ api, path, body: params }),
+    body: JSON.stringify({ api, path, [httpMethod === 'GET' ? 'query' : 'body']: params }),
   })
   if (!res.ok) return null
   const json = await res.json()
@@ -50,7 +55,7 @@ interface Profile {
 }
 
 async function tryTomba(linkedinUrl: string): Promise<{ email: string | null }> {
-  const data = await callOrthogonal('tomba', '/v1/linkedin', { url: linkedinUrl })
+  const data = await callOrthogonal('tomba', '/v1/linkedin', { url: linkedinUrl }, 'GET')
   if (!data) return { email: null }
   const email = data?.data?.email ?? data?.email ?? null
   return { email: email || null }
@@ -81,7 +86,7 @@ async function tryApollo(linkedinUrl: string): Promise<{ email: string | null; p
 async function tryContactOut(linkedinUrl: string): Promise<{ emails: string[] }> {
   const data = await callOrthogonal('contactout', '/v1/people/linkedin', {
     profile: linkedinUrl,
-  })
+  }, 'GET')
   if (!data) return { emails: [] }
   const p = data?.profile
   if (!p) return { emails: [] }
