@@ -41,12 +41,20 @@ service role key), `NEXT_PUBLIC_SITE_URL` (OG/social previews)
 Run `supabase/migrations/0001_rate_limit_and_budget.sql` in the Supabase SQL editor.
 Without it, every lookup fails closed.
 
-## Deferred: platform-level bot protection
-We removed Cloudflare Turnstile (the in-app CAPTCHA). For now the spend cap is the
-backstop. When ready to add bot protection, do it at the Vercel layer rather than
-re-adding a visible CAPTCHA:
+## Status
+Live and working at `getemailfromlinkedin.vercel.app`. Supabase migration run,
+env vars set. Cloudflare Turnstile fully removed and its Vercel env vars deleted.
+
+## NEXT TASK: add platform-level bot protection
+Currently the only abuse defenses are the per-visitor rate limit and the global
+spend cap (the hard backstop). There is no bot challenge in front of `/api/lookup`,
+so a determined script can hit it directly — cost is bounded by the spend cap, but
+we want a real gate. Add it at the Vercel layer rather than re-adding a visible
+CAPTCHA:
 - **Vercel WAF rate-limit rule** on `/api/lookup` (Pro) — edge throttling by IP,
-  recommended first step.
+  recommended first step, dashboard-only (no code).
 - **Vercel BotID** — invisible bot detection (Turnstile equivalent); has an SDK.
   "Deep Analysis" needs Pro/Enterprise. Wire-up is a small code change if wanted.
 - **Attack Challenge Mode** — emergency toggle if hammered.
+
+Confirm the Vercel plan before wiring BotID in code.
