@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createServiceClient } from '@/lib/supabase'
-import { hashIp } from '@/lib/hash'
+import { hashIdentity } from '@/lib/hash'
+import { verifyVisitorCookie } from '@/lib/identity'
 
 const ORTHOGONAL_URL = 'https://api.orthogonal.com/v1/run'
 const RATE_LIMIT = 3
@@ -206,7 +207,11 @@ async function handleLookup(request: NextRequest) {
   }
 
   // 4. Atomic per-user rate limit (advisory-locked count + insert).
-  const identity = await hashIp(ip)
+  //    Key on the signed visitor cookie when present (so distinct people on a
+  //    shared IP each get their own quota), falling back to IP for cookieless
+  //    clients (e.g. scripts hitting the API directly).
+  const visitorId = await verifyVisitorCookie(request.cookies.get('lid')?.value)
+  const identity = await hashIdentity(visitorId ? `v:${visitorId}` : `ip:${ip}`)
   const { data: attemptCount, error: rlErr } = await supabase.rpc('check_and_log_attempt', {
     p_identity: identity,
     p_limit: RATE_LIMIT,
