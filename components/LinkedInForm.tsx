@@ -4,7 +4,15 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import Turnstile from 'react-turnstile'
 import Image from 'next/image'
 
-type UIState = 'idle' | 'loading' | 'success' | 'not_found' | 'rate_limited' | 'invalid_url'
+type UIState =
+  | 'idle'
+  | 'loading'
+  | 'success'
+  | 'not_found'
+  | 'rate_limited'
+  | 'at_capacity'
+  | 'invalid_url'
+  | 'error'
 
 interface Profile {
   name?: string
@@ -12,6 +20,8 @@ interface Profile {
   company?: string
   photoUrl?: string
 }
+
+const ORTHOGONAL_CTA = 'https://orthogonal.com?utm_source=linkedin-email-demo&utm_medium=referral'
 
 export default function LinkedInForm() {
   const [url, setUrl] = useState('')
@@ -22,7 +32,7 @@ export default function LinkedInForm() {
   const [copiedIdx, setCopiedIdx] = useState<number | null>(null)
   const [showModal, setShowModal] = useState(false)
   const [turnstileToken, setTurnstileToken] = useState('')
-  const [fingerprint, setFingerprint] = useState('')
+  const [loadingMsg, setLoadingMsg] = useState('looking...')
 
   const cardRef = useRef<HTMLDivElement>(null)
   const cardCanvasRef = useRef<HTMLCanvasElement>(null)
@@ -32,16 +42,7 @@ export default function LinkedInForm() {
   const btnCanvasRef = useRef<HTMLCanvasElement>(null)
   const resultRef = useRef<HTMLDivElement>(null)
   const resultCanvasRef = useRef<HTMLCanvasElement>(null)
-
-  useEffect(() => {
-    ;(async () => {
-      try {
-        const { getFingerprint } = await import('@thumbmarkjs/thumbmarkjs')
-        const fp = await getFingerprint()
-        setFingerprint(String(fp))
-      } catch { /* best-effort */ }
-    })()
-  }, [])
+  const slowTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const drawAll = useCallback(async () => {
     const rough = (await import('roughjs')).default
@@ -73,27 +74,34 @@ export default function LinkedInForm() {
       roughness: 2.5, strokeWidth: 3, stroke: '#111', bowing: 2,
     })
 
-    if (resultRef.current && resultCanvasRef.current && uiState === 'success') {
-      sketchBox(resultCanvasRef.current, resultRef.current, {
-        roughness: 2, strokeWidth: 2.2, stroke: '#3fb43a', bowing: 1.5,
-      })
+    const resultStroke: Record<string, string> = {
+      success: '#3fb43a',
+      not_found: '#d81e1e',
+      rate_limited: '#888',
+      at_capacity: '#888',
+      error: '#d81e1e',
     }
-    if (resultRef.current && resultCanvasRef.current && uiState === 'not_found') {
+    if (resultRef.current && resultCanvasRef.current && resultStroke[uiState]) {
       sketchBox(resultCanvasRef.current, resultRef.current, {
-        roughness: 2.2, strokeWidth: 2, stroke: '#d81e1e', bowing: 1.8,
-      })
-    }
-    if (resultRef.current && resultCanvasRef.current && uiState === 'rate_limited') {
-      sketchBox(resultCanvasRef.current, resultRef.current, {
-        roughness: 2, strokeWidth: 2, stroke: '#888', bowing: 1.2,
+        roughness: 2, strokeWidth: 2.1, stroke: resultStroke[uiState], bowing: 1.5,
       })
     }
   }, [uiState])
 
+  // Redraw on mount/state change, and on resize (debounced).
   useEffect(() => {
     const t = setTimeout(drawAll, 100)
-    window.addEventListener('resize', drawAll)
-    return () => { clearTimeout(t); window.removeEventListener('resize', drawAll) }
+    let resizeTimer: ReturnType<typeof setTimeout>
+    const onResize = () => {
+      clearTimeout(resizeTimer)
+      resizeTimer = setTimeout(drawAll, 150)
+    }
+    window.addEventListener('resize', onResize)
+    return () => {
+      clearTimeout(t)
+      clearTimeout(resizeTimer)
+      window.removeEventListener('resize', onResize)
+    }
   }, [drawAll])
 
   async function handleSubmit(e: React.FormEvent) {
@@ -104,11 +112,14 @@ export default function LinkedInForm() {
     }
     setUiState('loading')
     setShowDropdown(false)
+    setLoadingMsg('looking...')
+    // The deep (ContactOut) path is the slow one — reassure rather than look stuck.
+    slowTimer.current = setTimeout(() => setLoadingMsg('checking deeper sources...'), 2500)
 
     try {
       const res = await fetch('/api/lookup', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-fingerprint': fingerprint },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: url.trim(), turnstileToken }),
       })
       const data = await res.json()
@@ -119,17 +130,20 @@ export default function LinkedInForm() {
         setUiState('success')
       } else if (data.rate_limited) {
         setUiState('rate_limited')
+      } else if (data.at_capacity) {
+        setUiState('at_capacity')
       } else if (data.not_found) {
         setUiState('not_found')
         setShowModal(true)
       } else if (data.invalid) {
         setUiState('invalid_url')
       } else {
-        setUiState('not_found')
-        setShowModal(true)
+        setUiState('error')
       }
     } catch {
-      setUiState('not_found')
+      setUiState('error')
+    } finally {
+      if (slowTimer.current) clearTimeout(slowTimer.current)
     }
   }
 
@@ -141,7 +155,25 @@ export default function LinkedInForm() {
 
   const isLoading = uiState === 'loading'
   const siteKey = process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY
+  // If Turnstile is enabled, the user must solve it before we'll submit.
+  const ready = !siteKey || !!turnstileToken
+  const submitDisabled = isLoading || !ready
   const hasDropdownContent = emails.length > 1 || !!profile
+
+  const showResult =
+    uiState === 'success' ||
+    uiState === 'not_found' ||
+    uiState === 'rate_limited' ||
+    uiState === 'at_capacity' ||
+    uiState === 'error'
+
+  const resultRotate: Record<string, string> = {
+    success: 'rotate(-0.3deg)',
+    not_found: 'rotate(0.5deg)',
+    rate_limited: 'rotate(-0.2deg)',
+    at_capacity: 'rotate(0.3deg)',
+    error: 'rotate(-0.4deg)',
+  }
 
   return (
     <>
@@ -178,26 +210,31 @@ export default function LinkedInForm() {
 
               {siteKey && (
                 <div style={{ display: 'flex', justifyContent: 'center' }}>
-                  <Turnstile sitekey={siteKey} onVerify={(token) => setTurnstileToken(token)} />
+                  <Turnstile
+                    sitekey={siteKey}
+                    onVerify={(token) => setTurnstileToken(token)}
+                    onExpire={() => setTurnstileToken('')}
+                  />
                 </div>
               )}
 
               {/* Button */}
-              <div ref={btnRef} style={{ position: 'relative', transform: 'rotate(0.7deg)', cursor: isLoading ? 'default' : 'pointer' }}>
+              <div ref={btnRef} style={{ position: 'relative', transform: 'rotate(0.7deg)', cursor: submitDisabled ? 'default' : 'pointer' }}>
                 <canvas ref={btnCanvasRef} style={{ position: 'absolute', top: '-8px', left: '-8px', pointerEvents: 'none', zIndex: 2 }} />
                 <button
                   type="submit"
-                  disabled={isLoading}
+                  disabled={submitDisabled}
                   style={{
                     width: '100%', padding: '13px 14px', fontFamily: 'inherit',
                     fontSize: '22px', fontWeight: 400, border: 'none',
                     background: 'transparent', color: '#111',
-                    cursor: isLoading ? 'default' : 'pointer',
+                    cursor: submitDisabled ? 'default' : 'pointer',
+                    opacity: !ready && !isLoading ? 0.45 : 1,
                     position: 'relative', zIndex: 1, letterSpacing: '1px',
                     display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '10px',
                   }}
                 >
-                  {isLoading ? <><Spinner /> looking...</> : 'find their email →'}
+                  {isLoading ? <><Spinner /> {loadingMsg}</> : 'find their email →'}
                 </button>
               </div>
             </form>
@@ -210,11 +247,8 @@ export default function LinkedInForm() {
       </div>
 
       {/* Result box */}
-      {(uiState === 'success' || uiState === 'not_found' || uiState === 'rate_limited') && (
-        <div style={{
-          width: '100%',
-          transform: uiState === 'success' ? 'rotate(-0.3deg)' : uiState === 'not_found' ? 'rotate(0.5deg)' : 'rotate(-0.2deg)',
-        }}>
+      {showResult && (
+        <div style={{ width: '100%', transform: resultRotate[uiState] }}>
           <div ref={resultRef} style={{ position: 'relative' }}>
             <canvas ref={resultCanvasRef} style={{ position: 'absolute', top: '-8px', left: '-8px', pointerEvents: 'none', zIndex: 2 }} />
             <div style={{
@@ -259,13 +293,9 @@ export default function LinkedInForm() {
                   {/* Dropdown content */}
                   {showDropdown && hasDropdownContent && (
                     <div style={{
-                      borderTop: '1px dashed #ddd',
-                      paddingTop: '10px',
-                      display: 'flex',
-                      flexDirection: 'column',
-                      gap: '8px',
+                      borderTop: '1px dashed #ddd', paddingTop: '10px',
+                      display: 'flex', flexDirection: 'column', gap: '8px',
                     }}>
-                      {/* Secondary emails */}
                       {emails.slice(1).map((em, i) => (
                         <div key={em} style={{ display: 'flex', alignItems: 'center', gap: '14px', paddingLeft: '46px' }}>
                           <span style={{ flex: 1, fontSize: '18px', color: '#444', wordBreak: 'break-all' }}>{em}</span>
@@ -283,7 +313,6 @@ export default function LinkedInForm() {
                         </div>
                       ))}
 
-                      {/* Profile info */}
                       {profile && (profile.name || profile.title || profile.company) && (
                         <div style={{
                           display: 'flex', alignItems: 'center', gap: '12px',
@@ -302,9 +331,7 @@ export default function LinkedInForm() {
                             />
                           )}
                           <div style={{ display: 'flex', flexDirection: 'column', gap: '1px' }}>
-                            {profile.name && (
-                              <span style={{ fontSize: '17px', color: '#111' }}>{profile.name}</span>
-                            )}
+                            {profile.name && <span style={{ fontSize: '17px', color: '#111' }}>{profile.name}</span>}
                             {(profile.title || profile.company) && (
                               <span style={{ fontSize: '14px', color: '#888' }}>
                                 {[profile.title, profile.company].filter(Boolean).join(' @ ')}
@@ -323,7 +350,7 @@ export default function LinkedInForm() {
                   <Image src="/x.svg" width={28} height={28} alt="not found" style={{ flexShrink: 0 }} />
                   <span style={{ flex: 1 }}>
                     this one is hard to find.{' '}
-                    <a href="https://orthogonal.com" target="_blank" rel="noopener noreferrer"
+                    <a href={ORTHOGONAL_CTA} target="_blank" rel="noopener noreferrer"
                       style={{ color: '#c0392b', textDecoration: 'underline', textDecorationStyle: 'wavy', textUnderlineOffset: '3px' }}>
                       sign up at orthogonal.com
                     </a>{' '}
@@ -337,10 +364,33 @@ export default function LinkedInForm() {
                   <Image src="/smiley.svg" width={40} height={32} alt="rate limited" style={{ flexShrink: 0 }} />
                   <span style={{ flex: 1 }}>
                     3/3 searches used today. back tomorrow — or{' '}
-                    <a href="https://orthogonal.com" target="_blank" rel="noopener noreferrer"
+                    <a href={ORTHOGONAL_CTA} target="_blank" rel="noopener noreferrer"
                       style={{ color: '#c0392b', textDecoration: 'underline', textDecorationStyle: 'wavy', textUnderlineOffset: '3px' }}>
                       sign up for unlimited.
                     </a>
+                  </span>
+                </div>
+              )}
+
+              {uiState === 'at_capacity' && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
+                  <Image src="/smiley.svg" width={40} height={32} alt="at capacity" style={{ flexShrink: 0 }} />
+                  <span style={{ flex: 1 }}>
+                    the free demo is at capacity today. come back tomorrow — or{' '}
+                    <a href={ORTHOGONAL_CTA} target="_blank" rel="noopener noreferrer"
+                      style={{ color: '#c0392b', textDecoration: 'underline', textDecorationStyle: 'wavy', textUnderlineOffset: '3px' }}>
+                      sign up at orthogonal.com
+                    </a>{' '}
+                    for unlimited lookups.
+                  </span>
+                </div>
+              )}
+
+              {uiState === 'error' && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
+                  <Image src="/x.svg" width={28} height={28} alt="error" style={{ flexShrink: 0 }} />
+                  <span style={{ flex: 1 }}>
+                    something went wrong on our end. give it another try in a moment.
                   </span>
                 </div>
               )}
@@ -373,7 +423,7 @@ export default function LinkedInForm() {
                 sign up at orthogonal.com to unlock more searches.
               </p>
               <a
-                href="https://orthogonal.com" target="_blank" rel="noopener noreferrer"
+                href={ORTHOGONAL_CTA} target="_blank" rel="noopener noreferrer"
                 style={{
                   display: 'block', width: '100%', padding: '13px 14px',
                   fontFamily: 'inherit', fontSize: '20px', textAlign: 'center',

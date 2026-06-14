@@ -1,10 +1,24 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createServiceClient } from '@/lib/supabase'
-import { hashIdentity } from '@/lib/hash'
+import { hashIp } from '@/lib/hash'
 
 const ORTHOGONAL_URL = 'https://api.orthogonal.com/v1/run'
 const RATE_LIMIT = 3
 const WINDOW_HOURS = 24
+const PROVIDER_TIMEOUT_MS = 8000
+
+// Hard global ceiling on credits the demo can spend in a rolling 24h, in cents.
+// A backstop independent of the per-user limit: even if that's bypassed, total
+// spend can't exceed this. Default $25/day; override with DAILY_BUDGET_CENTS.
+const DAILY_BUDGET_CENTS = Number(process.env.DAILY_BUDGET_CENTS ?? 2500)
+
+// Per-provider cost in cents (Orthogonal charges on a successful HTTP call,
+// regardless of whether an email was found).
+const COST = { tomba: 1, apollo: 1, contactout: 33 }
+
+function isProd() {
+  return process.env.NODE_ENV === 'production'
+}
 
 // Normalize any LinkedIn URL variant to https://www.linkedin.com/in/slug
 function cleanLinkedInUrl(input: string): string | null {
@@ -13,38 +27,74 @@ function cleanLinkedInUrl(input: string): string | null {
   return `https://www.linkedin.com/in/${match[1]}`
 }
 
-async function verifyTurnstile(token: string, ip: string): Promise<boolean> {
-  const res = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      secret: process.env.TURNSTILE_SECRET_KEY!,
-      response: token,
-      remoteip: ip,
-    }),
-  })
-  const data = await res.json()
-  return data.success === true
+async function fetchWithTimeout(url: string, opts: RequestInit, ms: number) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), ms)
+  try {
+    return await fetch(url, { ...opts, signal: controller.signal })
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
-// Orthogonal REST API: GET endpoints use `query`, POST endpoints use `body`
+async function verifyTurnstile(token: string, ip: string): Promise<boolean> {
+  try {
+    const res = await fetchWithTimeout(
+      'https://challenges.cloudflare.com/turnstile/v0/siteverify',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          secret: process.env.TURNSTILE_SECRET_KEY!,
+          response: token,
+          remoteip: ip,
+        }),
+      },
+      PROVIDER_TIMEOUT_MS
+    )
+    const data = await res.json()
+    return data.success === true
+  } catch {
+    return false
+  }
+}
+
+// Orthogonal REST API: GET endpoints use `query`, POST endpoints use `body`.
+// Returns { ok } so callers can tell a clean "no result" from a real failure
+// (timeout / network / non-2xx) — the two must surface differently to users.
 async function callOrthogonal(
   api: string,
   path: string,
   params: Record<string, unknown>,
   httpMethod: 'GET' | 'POST' = 'POST'
-) {
-  const res = await fetch(ORTHOGONAL_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${process.env.ORTHOGONAL_API_KEY}`,
-    },
-    body: JSON.stringify({ api, path, [httpMethod === 'GET' ? 'query' : 'body']: params }),
-  })
-  if (!res.ok) return null
-  const json = await res.json()
-  return json?.data ?? json
+): Promise<{ ok: boolean; data: unknown }> {
+  try {
+    const res = await fetchWithTimeout(
+      ORTHOGONAL_URL,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${process.env.ORTHOGONAL_API_KEY}`,
+        },
+        body: JSON.stringify({
+          api,
+          path,
+          [httpMethod === 'GET' ? 'query' : 'body']: params,
+        }),
+      },
+      PROVIDER_TIMEOUT_MS
+    )
+    if (!res.ok) {
+      console.error(`[orthogonal] ${api}${path} → HTTP ${res.status}`)
+      return { ok: false, data: null }
+    }
+    const json = await res.json()
+    return { ok: true, data: (json as { data?: unknown })?.data ?? json }
+  } catch (err) {
+    console.error(`[orthogonal] ${api}${path} → ${(err as Error).name}`)
+    return { ok: false, data: null }
+  }
 }
 
 interface Profile {
@@ -54,107 +104,164 @@ interface Profile {
   photoUrl?: string
 }
 
-async function tryTomba(linkedinUrl: string): Promise<{ email: string | null }> {
-  const data = await callOrthogonal('tomba', '/v1/linkedin', { url: linkedinUrl }, 'GET')
-  if (!data) return { email: null }
-  const email = data?.data?.email ?? data?.email ?? null
-  return { email: email || null }
+async function tryTomba(linkedinUrl: string): Promise<{ ok: boolean; email: string | null }> {
+  const { ok, data } = await callOrthogonal('tomba', '/v1/linkedin', { url: linkedinUrl }, 'GET')
+  const d = data as { data?: { email?: string }; email?: string } | null
+  const email = d?.data?.email ?? d?.email ?? null
+  return { ok, email: email || null }
 }
 
-async function tryApollo(linkedinUrl: string): Promise<{ email: string | null; profile?: Profile }> {
-  const data = await callOrthogonal('apollo', '/api/v1/people/match', {
+async function tryApollo(
+  linkedinUrl: string
+): Promise<{ ok: boolean; email: string | null; profile?: Profile }> {
+  const { ok, data } = await callOrthogonal('apollo', '/api/v1/people/match', {
     linkedin_url: linkedinUrl,
     reveal_personal_emails: false,
   })
-  if (!data) return { email: null }
-  const person = data?.person
-  if (!person) return { email: null }
+  const person = (data as { person?: Record<string, unknown> } | null)?.person
+  if (!person) return { ok, email: null }
 
+  const org = person.organization as { name?: string } | undefined
   const profile: Profile = {
-    name: person.name ?? undefined,
-    title: person.title ?? undefined,
-    company: person.organization?.name ?? undefined,
-    photoUrl: person.photo_url ?? undefined,
+    name: (person.name as string) ?? undefined,
+    title: (person.title as string) ?? undefined,
+    company: org?.name ?? undefined,
+    photoUrl: (person.photo_url as string) ?? undefined,
   }
 
   return {
-    email: person.email || null,
+    ok,
+    email: (person.email as string) || null,
     profile: profile.name || profile.title ? profile : undefined,
   }
 }
 
-async function tryContactOut(linkedinUrl: string): Promise<{ emails: string[] }> {
-  const data = await callOrthogonal('contactout', '/v1/people/linkedin', {
-    profile: linkedinUrl,
-  }, 'GET')
-  if (!data) return { emails: [] }
-  const p = data?.profile
-  if (!p) return { emails: [] }
-  const workEmails: string[] = Array.isArray(p.work_email) ? p.work_email : []
-  const anyEmails: string[] = Array.isArray(p.email) ? p.email : []
-  return { emails: Array.from(new Set([...workEmails, ...anyEmails])).filter(Boolean) }
+async function tryContactOut(linkedinUrl: string): Promise<{ ok: boolean; emails: string[] }> {
+  const { ok, data } = await callOrthogonal(
+    'contactout',
+    '/v1/people/linkedin',
+    { profile: linkedinUrl },
+    'GET'
+  )
+  const p = (data as { profile?: { work_email?: string[]; email?: string[] } } | null)?.profile
+  if (!p) return { ok, emails: [] }
+  // Work emails first — this is a work-email finder.
+  const workEmails = Array.isArray(p.work_email) ? p.work_email : []
+  const anyEmails = Array.isArray(p.email) ? p.email : []
+  return { ok, emails: Array.from(new Set([...workEmails, ...anyEmails])).filter(Boolean) }
 }
 
 export async function POST(request: NextRequest) {
+  // Never let an unexpected throw (e.g. Supabase misconfig) leak a bare HTML
+  // 500 — a public API should always answer with clean JSON the UI can read.
+  try {
+    return await handleLookup(request)
+  } catch (err) {
+    console.error('[lookup] unhandled:', (err as Error).message)
+    return NextResponse.json({ error: 'server' }, { status: 500 })
+  }
+}
+
+async function handleLookup(request: NextRequest) {
   const body = await request.json().catch(() => null)
   if (!body) return NextResponse.json({ error: 'bad_request' }, { status: 400 })
 
   const { url, turnstileToken } = body as { url?: string; turnstileToken?: string }
-  const fingerprint = request.headers.get('x-fingerprint') ?? ''
   const ip =
     request.headers.get('x-forwarded-for')?.split(',')[0].trim() ??
     request.headers.get('x-real-ip') ??
     'unknown'
 
-  // 1. Clean + validate LinkedIn URL
+  // 1. Clean + validate LinkedIn URL (no cost, no DB — reject junk early)
   const cleanUrl = url ? cleanLinkedInUrl(url) : null
   if (!cleanUrl) {
     return NextResponse.json({ invalid: true }, { status: 400 })
   }
 
-  // 2. Verify Turnstile (skip in dev when key is missing)
-  if (process.env.TURNSTILE_SECRET_KEY) {
+  // 2. Turnstile. Required in production — fail closed if it isn't configured,
+  //    so a misconfigured deploy can't silently run with no bot protection.
+  const turnstileConfigured = !!process.env.TURNSTILE_SECRET_KEY
+  if (isProd() && !turnstileConfigured) {
+    console.error('[lookup] Turnstile not configured in production — refusing paid calls')
+    return NextResponse.json({ error: 'server' }, { status: 500 })
+  }
+  if (turnstileConfigured) {
     const valid = await verifyTurnstile(turnstileToken ?? '', ip)
     if (!valid) return NextResponse.json({ error: 'captcha_failed' }, { status: 400 })
   }
 
-  // 3. Hash user identity + check rate limit
-  const userHash = await hashIdentity(ip, fingerprint)
   const supabase = createServiceClient()
-  const windowStart = new Date(Date.now() - WINDOW_HOURS * 60 * 60 * 1000).toISOString()
-  const { count } = await supabase
-    .from('attempts')
-    .select('id', { count: 'exact', head: true })
-    .eq('user_hash', userHash)
-    .gt('created_at', windowStart)
 
-  if ((count ?? 0) >= RATE_LIMIT) {
+  // 3. Global budget check BEFORE consuming the user's quota, so a user who
+  //    hits the cap doesn't also burn one of their free lookups.
+  const { data: spentCents, error: spendErr } = await supabase.rpc('recent_spend_cents', {
+    p_window_hours: WINDOW_HOURS,
+  })
+  if (spendErr) {
+    console.error('[lookup] spend check failed:', spendErr.message)
+    return NextResponse.json({ error: 'server' }, { status: 500 }) // fail closed
+  }
+  if ((spentCents ?? 0) >= DAILY_BUDGET_CENTS) {
+    return NextResponse.json({ at_capacity: true }, { status: 503 })
+  }
+
+  // 4. Atomic per-user rate limit (advisory-locked count + insert).
+  const identity = await hashIp(ip)
+  const { data: attemptCount, error: rlErr } = await supabase.rpc('check_and_log_attempt', {
+    p_identity: identity,
+    p_limit: RATE_LIMIT,
+    p_window_hours: WINDOW_HOURS,
+  })
+  if (rlErr) {
+    console.error('[lookup] rate-limit check failed:', rlErr.message)
+    return NextResponse.json({ error: 'server' }, { status: 500 }) // fail closed
+  }
+  if (attemptCount === -1) {
     return NextResponse.json({ rate_limited: true }, { status: 429 })
   }
 
-  // 4. Log attempt
-  await supabase.from('attempts').insert({ user_hash: userHash })
-
   // 5. Tomba + Apollo in parallel ($0.01 each)
-  const [tombaResult, apolloResult] = await Promise.allSettled([
-    tryTomba(cleanUrl),
-    tryApollo(cleanUrl),
-  ])
+  const [tombaR, apolloR] = await Promise.all([tryTomba(cleanUrl), tryApollo(cleanUrl)])
 
-  const tombaEmail = tombaResult.status === 'fulfilled' ? tombaResult.value.email : null
-  const apolloEmail = apolloResult.status === 'fulfilled' ? apolloResult.value.email : null
-  const profile = apolloResult.status === 'fulfilled' ? apolloResult.value.profile : undefined
+  let spent = (tombaR.ok ? COST.tomba : 0) + (apolloR.ok ? COST.apollo : 0)
+  const providers: string[] = []
+  if (tombaR.ok) providers.push('tomba')
+  if (apolloR.ok) providers.push('apollo')
 
-  const emails = Array.from(new Set([tombaEmail, apolloEmail].filter(Boolean) as string[]))
+  const profile = apolloR.profile
+  let emails = Array.from(
+    new Set([tombaR.email, apolloR.email].filter(Boolean) as string[])
+  )
+
+  // 6. ContactOut fallback ($0.33) only if the cheap providers found nothing
+  let contactOutOk = false
+  if (emails.length === 0) {
+    const co = await tryContactOut(cleanUrl)
+    contactOutOk = co.ok
+    if (co.ok) {
+      spent += COST.contactout
+      providers.push('contactout')
+    }
+    if (co.emails.length > 0) emails = co.emails
+  }
+
+  // 7. Record spend (best-effort; the global cap is the real guard)
+  if (spent > 0) {
+    const { error } = await supabase
+      .from('spend_log')
+      .insert({ cost_cents: spent, providers: providers.join('+') })
+    if (error) console.error('[lookup] spend_log insert failed:', error.message)
+  }
 
   if (emails.length > 0) {
     return NextResponse.json({ emails, profile })
   }
 
-  // 6. ContactOut fallback ($0.33)
-  const contactOut = await tryContactOut(cleanUrl)
-  if (contactOut.emails.length > 0) {
-    return NextResponse.json({ emails: contactOut.emails, profile })
+  // 8. Distinguish a genuine miss from a system failure. If every provider we
+  //    called errored, this is our problem, not "hard to find".
+  const anyProviderResponded = tombaR.ok || apolloR.ok || contactOutOk
+  if (!anyProviderResponded) {
+    return NextResponse.json({ error: 'server' }, { status: 502 })
   }
 
   return NextResponse.json({ not_found: true })

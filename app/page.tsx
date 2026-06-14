@@ -59,7 +59,7 @@ export default function Home() {
         >
           powered by{' '}
           <a
-            href="https://orthogonal.com"
+            href="https://orthogonal.com?utm_source=linkedin-email-demo&utm_medium=referral&utm_content=footer"
             target="_blank"
             rel="noopener noreferrer"
             style={{
