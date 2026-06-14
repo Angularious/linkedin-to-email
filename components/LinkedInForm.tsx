@@ -1,7 +1,6 @@
 'use client'
 
 import { useState, useEffect, useRef, useCallback } from 'react'
-import Turnstile from 'react-turnstile'
 import Image from 'next/image'
 
 type UIState =
@@ -31,7 +30,6 @@ export default function LinkedInForm() {
   const [showDropdown, setShowDropdown] = useState(false)
   const [copiedIdx, setCopiedIdx] = useState<number | null>(null)
   const [showModal, setShowModal] = useState(false)
-  const [turnstileToken, setTurnstileToken] = useState('')
   const [loadingMsg, setLoadingMsg] = useState('looking...')
 
   const cardRef = useRef<HTMLDivElement>(null)
@@ -120,7 +118,7 @@ export default function LinkedInForm() {
       const res = await fetch('/api/lookup', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url.trim(), turnstileToken }),
+        body: JSON.stringify({ url: url.trim() }),
       })
       const data = await res.json()
 
@@ -154,10 +152,6 @@ export default function LinkedInForm() {
   }
 
   const isLoading = uiState === 'loading'
-  const siteKey = process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY
-  // If Turnstile is enabled, the user must solve it before we'll submit.
-  const ready = !siteKey || !!turnstileToken
-  const submitDisabled = isLoading || !ready
   const hasDropdownContent = emails.length > 1 || !!profile
 
   const showResult =
@@ -208,28 +202,17 @@ export default function LinkedInForm() {
                 </p>
               )}
 
-              {siteKey && (
-                <div style={{ display: 'flex', justifyContent: 'center' }}>
-                  <Turnstile
-                    sitekey={siteKey}
-                    onVerify={(token) => setTurnstileToken(token)}
-                    onExpire={() => setTurnstileToken('')}
-                  />
-                </div>
-              )}
-
               {/* Button */}
-              <div ref={btnRef} style={{ position: 'relative', transform: 'rotate(0.7deg)', cursor: submitDisabled ? 'default' : 'pointer' }}>
+              <div ref={btnRef} style={{ position: 'relative', transform: 'rotate(0.7deg)', cursor: isLoading ? 'default' : 'pointer' }}>
                 <canvas ref={btnCanvasRef} style={{ position: 'absolute', top: '-8px', left: '-8px', pointerEvents: 'none', zIndex: 2 }} />
                 <button
                   type="submit"
-                  disabled={submitDisabled}
+                  disabled={isLoading}
                   style={{
                     width: '100%', padding: '13px 14px', fontFamily: 'inherit',
                     fontSize: '22px', fontWeight: 400, border: 'none',
                     background: 'transparent', color: '#111',
-                    cursor: submitDisabled ? 'default' : 'pointer',
-                    opacity: !ready && !isLoading ? 0.45 : 1,
+                    cursor: isLoading ? 'default' : 'pointer',
                     position: 'relative', zIndex: 1, letterSpacing: '1px',
                     display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '10px',
                   }}

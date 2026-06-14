@@ -6,10 +6,11 @@
 // people on a shared IP — students on campus WiFi, coworkers behind one NAT —
 // each get their own quota instead of colliding on the IP.
 //
-// This is NOT the abuse defense (Turnstile + the global spend cap are). An
-// abuser can still mint cookies by reloading the page, but each lookup still
-// costs them a Turnstile solve and is bounded by the daily cap. The cookie's
-// job is purely to stop legitimate users from blocking each other.
+// This is NOT the abuse defense (the global spend cap and per-identity rate
+// limit are; platform-level bot protection runs in front via Vercel). An
+// abuser can still mint cookies by reloading the page, but total spend is
+// bounded by the daily cap regardless. The cookie's job is purely to stop
+// legitimate users from blocking each other on a shared IP.
 
 const enc = new TextEncoder()
 

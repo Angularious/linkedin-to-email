@@ -17,10 +17,6 @@ const DAILY_BUDGET_CENTS = Number(process.env.DAILY_BUDGET_CENTS ?? 2500)
 // regardless of whether an email was found).
 const COST = { tomba: 1, apollo: 1, contactout: 33 }
 
-function isProd() {
-  return process.env.NODE_ENV === 'production'
-}
-
 // Normalize any LinkedIn URL variant to https://www.linkedin.com/in/slug
 function cleanLinkedInUrl(input: string): string | null {
   const match = input.trim().match(/linkedin\.com\/in\/([a-zA-Z0-9_-]+)/i)
@@ -35,28 +31,6 @@ async function fetchWithTimeout(url: string, opts: RequestInit, ms: number) {
     return await fetch(url, { ...opts, signal: controller.signal })
   } finally {
     clearTimeout(timer)
-  }
-}
-
-async function verifyTurnstile(token: string, ip: string): Promise<boolean> {
-  try {
-    const res = await fetchWithTimeout(
-      'https://challenges.cloudflare.com/turnstile/v0/siteverify',
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
-          secret: process.env.TURNSTILE_SECRET_KEY!,
-          response: token,
-          remoteip: ip,
-        }),
-      },
-      PROVIDER_TIMEOUT_MS
-    )
-    const data = await res.json()
-    return data.success === true
-  } catch {
-    return false
   }
 }
 
@@ -167,7 +141,7 @@ async function handleLookup(request: NextRequest) {
   const body = await request.json().catch(() => null)
   if (!body) return NextResponse.json({ error: 'bad_request' }, { status: 400 })
 
-  const { url, turnstileToken } = body as { url?: string; turnstileToken?: string }
+  const { url } = body as { url?: string }
   const ip =
     request.headers.get('x-forwarded-for')?.split(',')[0].trim() ??
     request.headers.get('x-real-ip') ??
@@ -179,21 +153,9 @@ async function handleLookup(request: NextRequest) {
     return NextResponse.json({ invalid: true }, { status: 400 })
   }
 
-  // 2. Turnstile. Required in production — fail closed if it isn't configured,
-  //    so a misconfigured deploy can't silently run with no bot protection.
-  const turnstileConfigured = !!process.env.TURNSTILE_SECRET_KEY
-  if (isProd() && !turnstileConfigured) {
-    console.error('[lookup] Turnstile not configured in production — refusing paid calls')
-    return NextResponse.json({ error: 'server' }, { status: 500 })
-  }
-  if (turnstileConfigured) {
-    const valid = await verifyTurnstile(turnstileToken ?? '', ip)
-    if (!valid) return NextResponse.json({ error: 'captcha_failed' }, { status: 400 })
-  }
-
   const supabase = createServiceClient()
 
-  // 3. Global budget check BEFORE consuming the user's quota, so a user who
+  // 2. Global budget check BEFORE consuming the user's quota, so a user who
   //    hits the cap doesn't also burn one of their free lookups.
   const { data: spentCents, error: spendErr } = await supabase.rpc('recent_spend_cents', {
     p_window_hours: WINDOW_HOURS,
