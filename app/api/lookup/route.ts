@@ -7,7 +7,16 @@ import { verifyVisitorCookie } from '@/lib/identity'
 const ORTHOGONAL_URL = 'https://api.orthogonal.com/v1/run'
 const RATE_LIMIT = 3
 const WINDOW_HOURS = 24
-const PROVIDER_TIMEOUT_MS = 8000
+
+// Vercel Hobby kills a function at 10s. The slow path runs two provider phases
+// sequentially — (Tomba ∥ Apollo) then ContactOut — so their timeouts must sum
+// to well under 10s (plus bot check + DB overhead) or Vercel returns a platform
+// 504 instead of our clean JSON. 3.5s + 5s + ~1s ≈ 9.5s worst case.
+const FAST_TIMEOUT_MS = 3500 // Tomba, Apollo (cheap, fast)
+const SLOW_TIMEOUT_MS = 5000 // ContactOut (expensive — give the paid call room)
+
+// Cap the function at the Hobby maximum explicitly.
+export const maxDuration = 10
 
 // Hard global ceiling on credits the demo can spend in a rolling 24h, in cents.
 // A backstop independent of the per-user limit: even if that's bypassed, total
@@ -42,7 +51,8 @@ async function callOrthogonal(
   api: string,
   path: string,
   params: Record<string, unknown>,
-  httpMethod: 'GET' | 'POST' = 'POST'
+  httpMethod: 'GET' | 'POST' = 'POST',
+  timeoutMs: number = FAST_TIMEOUT_MS
 ): Promise<{ ok: boolean; data: unknown }> {
   try {
     const res = await fetchWithTimeout(
@@ -59,7 +69,7 @@ async function callOrthogonal(
           [httpMethod === 'GET' ? 'query' : 'body']: params,
         }),
       },
-      PROVIDER_TIMEOUT_MS
+      timeoutMs
     )
     if (!res.ok) {
       console.error(`[orthogonal] ${api}${path} → HTTP ${res.status}`)
@@ -117,7 +127,8 @@ async function tryContactOut(linkedinUrl: string): Promise<{ ok: boolean; emails
     'contactout',
     '/v1/people/linkedin',
     { profile: linkedinUrl },
-    'GET'
+    'GET',
+    SLOW_TIMEOUT_MS
   )
   const p = (data as { profile?: { work_email?: string[]; email?: string[] } } | null)?.profile
   if (!p) return { ok, emails: [] }
@@ -148,8 +159,28 @@ async function handleLookup(request: NextRequest) {
     request.headers.get('x-real-ip') ??
     'unknown'
 
-  // 1. Clean + validate LinkedIn URL (no cost, no DB — reject junk early)
-  const cleanUrl = url ? cleanLinkedInUrl(url) : null
+  // 0. Reject cross-origin POSTs. Our UI always sends a same-origin request
+  //    (Origin host === Host); a present, mismatched Origin is a direct/CSRF-
+  //    style call. A missing Origin is allowed (some privacy tools strip it) —
+  //    BotID + the rate limit still cover those.
+  const origin = request.headers.get('origin')
+  const host = request.headers.get('host')
+  if (origin && host) {
+    try {
+      if (new URL(origin).host !== host) {
+        return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+      }
+    } catch {
+      return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+    }
+  }
+
+  // 1. Validate input length, then clean + validate the LinkedIn URL (no cost,
+  //    no DB — reject junk early before any bot check or paid work).
+  if (typeof url !== 'string' || url.length > 2000) {
+    return NextResponse.json({ invalid: true }, { status: 400 })
+  }
+  const cleanUrl = cleanLinkedInUrl(url)
   if (!cleanUrl) {
     return NextResponse.json({ invalid: true }, { status: 400 })
   }
@@ -163,7 +194,7 @@ async function handleLookup(request: NextRequest) {
 
   const supabase = createServiceClient()
 
-  // 2. Global budget check BEFORE consuming the user's quota, so a user who
+  // 3. Global budget check BEFORE consuming the user's quota, so a user who
   //    hits the cap doesn't also burn one of their free lookups.
   const { data: spentCents, error: spendErr } = await supabase.rpc('recent_spend_cents', {
     p_window_hours: WINDOW_HOURS,

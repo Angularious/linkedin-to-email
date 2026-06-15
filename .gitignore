@@ -1,5 +1,6 @@
-.env.local
-.env*.local
+.env
+.env.*
+!.env.local.example
 node_modules/
 .next/
 out/
