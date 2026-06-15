@@ -21,7 +21,11 @@ so abuse/cost protection matters.
 Provider response shapes are unwrapped from Orthogonal's `{ data: ... }` envelope.
 GET endpoints (Tomba, ContactOut) pass params as `query`; POST (Apollo) as `body`.
 
-## Protection model (3 layers, no Cloudflare)
+## Protection model (4 layers, no Cloudflare)
+- **Bot detection** — Vercel BotID ('basic' free tier) guards POST `/api/lookup`.
+  `withBotId` in next.config, `<BotIdClient>` in the layout, `checkBotId()` in the
+  route right after URL validation (before any DB/paid work; 403 if flagged).
+  No-ops in local dev. Upgrade path: deepAnalysis check level (requires Pro).
 - **Per-visitor rate limit** — 3 lookups / rolling 24h. Identity = signed httpOnly
   cookie issued by `middleware.ts` on page load, falling back to IP for cookieless
   clients. Lets distinct people on a shared IP (campus/office WiFi) each get their
@@ -43,18 +47,11 @@ Without it, every lookup fails closed.
 
 ## Status
 Live and working at `getemailfromlinkedin.vercel.app`. Supabase migration run,
-env vars set. Cloudflare Turnstile fully removed and its Vercel env vars deleted.
+env vars set. Cloudflare Turnstile fully removed. Vercel BotID (basic) added as
+the bot gate. All four protection layers in place — no known open items.
 
-## NEXT TASK: add platform-level bot protection
-Currently the only abuse defenses are the per-visitor rate limit and the global
-spend cap (the hard backstop). There is no bot challenge in front of `/api/lookup`,
-so a determined script can hit it directly — cost is bounded by the spend cap, but
-we want a real gate. Add it at the Vercel layer rather than re-adding a visible
-CAPTCHA:
-- **Vercel WAF rate-limit rule** on `/api/lookup` (Pro) — edge throttling by IP,
-  recommended first step, dashboard-only (no code).
-- **Vercel BotID** — invisible bot detection (Turnstile equivalent); has an SDK.
-  "Deep Analysis" needs Pro/Enterprise. Wire-up is a small code change if wanted.
-- **Attack Challenge Mode** — emergency toggle if hammered.
-
-Confirm the Vercel plan before wiring BotID in code.
+## Possible future hardening (not urgent)
+- **Vercel WAF rate-limit rule** on `/api/lookup` — edge throttling by IP before
+  the function runs. Dashboard-only, but requires the Pro plan.
+- **BotID deepAnalysis** check level — stronger detection, requires Pro.
+- **Attack Challenge Mode** — emergency toggle (Firewall tab) if actively hammered.
