@@ -1,7 +1,13 @@
 import type { Metadata } from 'next'
 import { Indie_Flower } from 'next/font/google'
 import { Analytics } from '@vercel/analytics/react'
+import { BotIdClient } from 'botid/client'
 import './globals.css'
+
+// Routes guarded by Vercel BotID. 'basic' is the free tier (deepAnalysis is Pro).
+const protectedRoutes = [
+  { path: '/api/lookup', method: 'POST', advancedOptions: { checkLevel: 'basic' as const } },
+]
 
 const indieFlower = Indie_Flower({
   weight: '400',
@@ -33,6 +39,9 @@ export const metadata: Metadata = {
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
+      <head>
+        <BotIdClient protect={protectedRoutes} />
+      </head>
       <body style={{ fontFamily: indieFlower.style.fontFamily }}>
         {children}
         <Analytics />

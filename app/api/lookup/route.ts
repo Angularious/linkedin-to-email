@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { checkBotId } from 'botid/server'
 import { createServiceClient } from '@/lib/supabase'
 import { hashIdentity } from '@/lib/hash'
 import { verifyVisitorCookie } from '@/lib/identity'
@@ -151,6 +152,13 @@ async function handleLookup(request: NextRequest) {
   const cleanUrl = url ? cleanLinkedInUrl(url) : null
   if (!cleanUrl) {
     return NextResponse.json({ invalid: true }, { status: 400 })
+  }
+
+  // 2. Bot check (Vercel BotID, 'basic' free tier). No-op in local dev. Runs
+  //    before any DB or paid work so flagged bots cost us nothing.
+  const bot = await checkBotId({ advancedOptions: { checkLevel: 'basic' } })
+  if (bot.isBot) {
+    return NextResponse.json({ error: 'bot_blocked' }, { status: 403 })
   }
 
   const supabase = createServiceClient()
