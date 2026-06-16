@@ -11,21 +11,25 @@ so abuse/cost protection matters.
   Providers: Ocean.io, Aviato, Apollo (cheap tier), Bytemine, ContactOut.
 - Hand-drawn UI via rough.js + Indie Flower font (inline styles)
 
-## Lookup pipeline (`app/api/lookup/route.ts`)
-1. Clean + validate the LinkedIn URL (regex → canonical `/in/<slug>`)
-2. Rate limit: per-IP ceiling + per-visitor quota (reject with `rate_limited`)
-3. Atomic budget *reservation* — books worst-case cost up front; `at_capacity` if
-   the daily cap is exhausted
-4. **Tier 1 — Ocean.io ∥ Aviato ∥ Apollo in parallel** ($0.01 each). Apollo and
-   Ocean also return profile data (incl. photo). Ocean takes the bare handle.
-5. **Tier 2 — Bytemine** ($0.03) only if Tier 1 misses. Also backfills profile.
-6. **Tier 3 — ContactOut** ($0.33), last resort — work emails preferred.
-7. Reconcile the reservation to actual spend; return `{ emails, profile, verified }`
-   / `not_found` / `error`
+## Lookup pipeline (`app/api/lookup/route.ts` — phased)
+The lookup is **3 separate HTTP calls** (`{ url, phase, token }`), the client
+(`LinkedInForm`) driving each only on a miss. Each phase is its own serverless
+invocation with its own 10s Vercel limit, so a slow provider doesn't have to
+share one 10s window — that cramming was aborting live calls. Per phase:
+- **Phase 1** — clean/validate URL → bot check + rate limit (the only quota
+  consumer) → reserve budget → **Ocean.io ∥ Aviato ∥ Apollo** ($0.01 each, ~8s
+  each). Apollo/Ocean also return the profile card. Hit → done.
+- **Phase 2** — verify single-use token → reserve → **Bytemine** ($0.03).
+- **Phase 3** — verify single-use token → reserve → **ContactOut** ($0.33).
 
-Worst-case cost ~$0.36, but expected cost is low: three independent $0.01 sources
-resolve most profiles before Bytemine/ContactOut are ever paid for. Per-call
-timeouts (3s + 2.5s + 3s) sum under the 10s Hobby cap.
+On a miss, a phase returns `{ continue, phase, token, profile }`; the client
+redeems `token` on the next call and accumulates `profile` across phases. A hit
+returns `{ emails, profile, verified }`; terminal states are `not_found` /
+`at_capacity` / `rate_limited` / `invalid` / `error`.
+
+Worst-case cost ~$0.36, but expected cost is low: three $0.01 sources resolve most
+profiles before Bytemine/ContactOut are paid for. Full-miss wall-clock is up to
+~3×10s, surfaced via "checking deeper / premium sources…" messaging.
 
 Provider response shapes are unwrapped from Orthogonal's `{ data: ... }` envelope.
 GET endpoints (Aviato, ContactOut) pass params as `query`; POST (Ocean, Apollo,
@@ -49,26 +53,28 @@ demo whose whole job is "paste a URL, get an email." Phone/salary/age remain a
 natural "sign up to unlock" hook for the orthogonal.com CTAs.
 
 ## Protection model (no Cloudflare)
-- **Bot detection** — Vercel BotID ('basic' free tier) guards POST `/api/lookup`.
-  `withBotId` in next.config, `<BotIdClient>` in the layout, `checkBotId()` in the
-  route right after URL validation (before any DB/paid work; 403 if flagged).
-  No-ops in local dev. Upgrade path: deepAnalysis check level (requires Pro).
-- **Rate limit — two buckets, both must have room.** Identity = signed httpOnly
-  cookie (`middleware.ts`) so distinct people on a shared IP each get a quota
-  (`RATE_LIMIT`, 3/24h). Because anyone can mint a fresh cookie, a per-IP ceiling
-  (`IP_RATE_LIMIT`, 30/24h) is enforced in parallel and can't be escaped by cookie
-  rotation; cookieless clients collapse to a single strict IP bucket. IP comes
-  from `request.ip` / `x-real-ip` only — NOT the spoofable first `X-Forwarded-For`
-  hop. Atomic via `check_and_log_attempt` (advisory lock kills the count→insert
-  race).
-- **Global spend cap — concurrency-safe.** `reserve_spend` books each lookup's
-  worst-case cost (`MAX_COST_CENTS`) under an advisory lock *before* any provider
-  call, then `reconcile_spend` corrects it to the real amount afterward. This
-  closes the TOCTOU race where bursting requests could all pass a plain pre-check
-  and collectively overshoot the cap. `DAILY_BUDGET_CENTS` default $30/24h. This
-  is the real money backstop. Trade-off: reserving the max can transiently show
-  `at_capacity` during a heavy burst (~77 in-flight lookups) even when actual
-  spend is low; it self-heals as reservations reconcile within seconds.
+- **Bot detection** — Vercel BotID ('basic' free tier) guards POST `/api/lookup`
+  at **phase 1**. `withBotId` in next.config, `<BotIdClient>` in the layout,
+  `checkBotId()` in the route (before any DB/paid work; 403 if flagged). No-ops in
+  local dev. Upgrade path: deepAnalysis check level (requires Pro).
+- **Rate limit — two buckets, both must have room — consumed once per lookup at
+  phase 1.** Identity = signed httpOnly cookie (`middleware.ts`) so distinct
+  people on a shared IP each get a quota (`RATE_LIMIT`, 3/24h). Because anyone can
+  mint a fresh cookie, a per-IP ceiling (`IP_RATE_LIMIT`, 30/24h) is enforced in
+  parallel and can't be escaped by cookie rotation; cookieless clients collapse to
+  a single strict IP bucket. IP comes from `request.ip` / `x-real-ip` only — NOT
+  the spoofable first `X-Forwarded-For` hop. Atomic via `check_and_log_attempt`.
+- **Phased continuation tokens.** Since phases 2/3 skip the bot/rate-limit gate,
+  phase 1 issues a **single-use, URL-bound, short-lived** token (`signLookupToken`,
+  HMAC over `nonce|expiry|url`); phases 2/3 verify it and redeem the nonce via
+  `consume_nonce` (unique-insert → false on replay). So one rate-limited phase-1
+  yields at most one Bytemine + one ContactOut call — a token can't be replayed to
+  hammer the paid tiers, and 2/3 can't be called directly without a valid token.
+- **Global spend cap — concurrency-safe, per phase.** Each phase calls
+  `reserve_spend` (books its tier's worst-case cost under an advisory lock *before*
+  the provider call) then `reconcile_spend` (corrects to the real amount). Closes
+  the TOCTOU race where bursting requests overshoot the cap. `DAILY_BUDGET_CENTS`
+  default $30/24h — the real money backstop.
 - Rate-limit and budget checks **fail closed** on any Supabase error.
 
 ## Env vars
@@ -80,13 +86,18 @@ default — update it there to change the cap in prod.
 
 ## Setup
 Run the migrations in `supabase/migrations/` in order in the Supabase SQL editor:
-`0001_rate_limit_and_budget.sql`, then `0002_budget_reservation.sql`. Without 0002
-the reservation RPCs are missing and every lookup fails closed.
+`0001_rate_limit_and_budget.sql`, `0002_budget_reservation.sql`, then
+`0003_lookup_nonces.sql`. Without 0002/0003 the RPCs are missing and every lookup
+fails closed. `lookup_nonces` grows one row per phase-2/3 call — prune old rows by
+`created_at` if it ever gets large.
 
 ## Status
 Live at `getemailfromlinkedin.vercel.app`. Cloudflare Turnstile removed; Vercel
-BotID (basic) is the bot gate. Spend cap is reservation-based (concurrency-safe,
-$30/day) and rate limiting enforces a cookie-proof per-IP ceiling on a trusted IP.
+BotID (basic) is the bot gate. Lookup is split into 3 phased calls so each tier
+gets a full 10s budget (fixed cold-start/slow-provider aborts). Spend cap is
+reservation-based (concurrency-safe, $30/day); rate limiting enforces a
+cookie-proof per-IP ceiling on a trusted IP, consumed once per lookup with
+single-use tokens guarding the continuation phases.
 
 ## Possible future hardening (not urgent)
 - **Vercel WAF rate-limit rule** on `/api/lookup` — edge throttling by IP before

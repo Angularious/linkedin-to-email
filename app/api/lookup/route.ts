@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { checkBotId } from 'botid/server'
 import { createServiceClient } from '@/lib/supabase'
 import { hashIdentity } from '@/lib/hash'
-import { verifyVisitorCookie } from '@/lib/identity'
+import { verifyVisitorCookie, signLookupToken, verifyLookupToken } from '@/lib/identity'
 
 const ORTHOGONAL_URL = 'https://api.orthogonal.com/v1/run'
 const RATE_LIMIT = 3 // per-visitor (signed cookie) lookups / 24h
@@ -14,17 +14,17 @@ const RATE_LIMIT = 3 // per-visitor (signed cookie) lookups / 24h
 const IP_RATE_LIMIT = 30
 const WINDOW_HOURS = 24
 
-// Vercel Hobby kills a function at 10s. Rather than give each provider phase a
-// fixed slice (too tight for cold starts — a 3s cap was aborting live Ocean
-// calls), we run against a wall-clock DEADLINE: every call gets the smaller of
-// its tier cap and the time left in the budget, and a tier is skipped if too
-// little headroom remains. The common path (Tier 1 hits) thus gets the full
-// generous window; only a full miss compresses the later tiers.
-const PROVIDER_BUDGET_MS = 8500 // total wall-clock for all provider phases (<10s cap)
-const MIN_CALL_MS = 800 // don't start a provider call with less headroom than this
-const TIER1_TIMEOUT_MS = 5000 // Ocean ∥ Aviato ∥ Apollo (parallel)
-const TIER2_TIMEOUT_MS = 3500 // Bytemine
-const TIER3_TIMEOUT_MS = 4000 // ContactOut
+// The lookup is split into 3 separate HTTP calls (phase 1: Ocean ∥ Aviato ∥
+// Apollo, phase 2: Bytemine, phase 3: ContactOut), the client driving each in
+// turn only on a miss. Each phase is its own serverless function with its own
+// 10s Vercel limit, so a slow provider no longer has to share one 10s window
+// with the others — the previous cramming was what aborted live calls. Within a
+// phase we still budget against a wall-clock deadline so we return clean JSON
+// instead of letting Vercel hard-kill the function at 10s.
+const PROVIDER_BUDGET_MS = 8500 // per-phase wall-clock for provider calls (<10s cap)
+const TIER1_TIMEOUT_MS = 8000 // phase 1: Ocean ∥ Aviato ∥ Apollo (parallel)
+const TIER2_TIMEOUT_MS = 8000 // phase 2: Bytemine
+const TIER3_TIMEOUT_MS = 8000 // phase 3: ContactOut
 
 // Cap the function at the Hobby maximum explicitly.
 export const maxDuration = 10
@@ -39,10 +39,6 @@ const DAILY_BUDGET_CENTS = Number(process.env.DAILY_BUDGET_CENTS ?? 3000)
 // rounded up to 1¢ so the budget cap errs high. ContactOut is $0.33 without
 // phone (verified against the marketplace pricing formula).
 const COST = { ocean: 1, apollo: 1, aviato: 1, bytemine: 3, contactout: 33 }
-
-// Worst case if every tier runs. Reserved against the budget up front so
-// concurrent bursts can't collectively overshoot the cap.
-const MAX_COST_CENTS = Object.values(COST).reduce((a, b) => a + b, 0)
 
 // Normalize any LinkedIn URL variant to https://www.linkedin.com/in/slug
 function cleanLinkedInUrl(input: string): string | null {
@@ -292,24 +288,23 @@ export async function POST(request: NextRequest) {
 }
 
 async function handleLookup(request: NextRequest) {
-  // Wall-clock start. Provider timeouts are budgeted against this so the bot
-  // check + DB work already spent counts against the 10s function limit.
+  // Wall-clock start. This phase's provider timeouts are budgeted against it so
+  // the gating work already spent counts against the 10s function limit.
   const t0 = Date.now()
   const timeLeft = () => PROVIDER_BUDGET_MS - (Date.now() - t0)
 
   const body = await request.json().catch(() => null)
   if (!body) return NextResponse.json({ error: 'bad_request' }, { status: 400 })
 
-  const { url } = body as { url?: string }
+  const { url, token, phase: rawPhase } = body as { url?: string; token?: string; phase?: number }
+  const phase = rawPhase === 2 ? 2 : rawPhase === 3 ? 3 : 1
   // Trust only platform-set values. The first X-Forwarded-For hop is
   // client-supplied and trivially spoofable, so never key the rate limit on it;
   // Vercel populates request.ip / x-real-ip from the real connection.
   const ip = request.ip ?? request.headers.get('x-real-ip') ?? 'unknown'
 
-  // 0. Reject cross-origin POSTs. Our UI always sends a same-origin request
-  //    (Origin host === Host); a present, mismatched Origin is a direct/CSRF-
-  //    style call. A missing Origin is allowed (some privacy tools strip it) —
-  //    BotID + the rate limit still cover those.
+  // 0. Reject cross-origin POSTs (all phases). Our UI always sends a same-origin
+  //    request; a present, mismatched Origin is a direct/CSRF-style call.
   const origin = request.headers.get('origin')
   const host = request.headers.get('host')
   if (origin && host) {
@@ -322,8 +317,7 @@ async function handleLookup(request: NextRequest) {
     }
   }
 
-  // 1. Validate input length, then clean + validate the LinkedIn URL (no cost,
-  //    no DB — reject junk early before any bot check or paid work).
+  // 1. Validate the LinkedIn URL (all phases — cheap, no cost).
   if (typeof url !== 'string' || url.length > 2000) {
     return NextResponse.json({ invalid: true }, { status: 400 })
   }
@@ -332,60 +326,78 @@ async function handleLookup(request: NextRequest) {
     return NextResponse.json({ invalid: true }, { status: 400 })
   }
 
-  // 2. Bot check (Vercel BotID, 'basic' free tier). No-op in local dev. Runs
-  //    before any DB or paid work so flagged bots cost us nothing.
-  const bot = await checkBotId({ advancedOptions: { checkLevel: 'basic' } })
-  if (bot.isBot) {
-    return NextResponse.json({ error: 'bot_blocked' }, { status: 403 })
-  }
-
   const supabase = createServiceClient()
 
-  // Atomic rate-limit check (advisory-locked count + insert). Returns the
-  // post-insert count, or -1 if already at/over the limit.
-  async function checkLimit(identity: string, limit: number) {
-    const { data, error } = await supabase.rpc('check_and_log_attempt', {
-      p_identity: identity,
-      p_limit: limit,
-      p_window_hours: WINDOW_HOURS,
-    })
-    if (error) {
-      console.error('[lookup] rate-limit check failed:', error.message)
-      return 'error' as const
+  // 2. Gate. Phase 1 is the only entry point: it runs the bot check + rate limit
+  //    and consumes the visitor's quota. Phases 2/3 are continuations that
+  //    present the single-use token phase 1 issued — we redeem its nonce here so
+  //    it can't be replayed to trigger repeat paid calls (esp. ContactOut).
+  if (phase === 1) {
+    const bot = await checkBotId({ advancedOptions: { checkLevel: 'basic' } })
+    if (bot.isBot) {
+      return NextResponse.json({ error: 'bot_blocked' }, { status: 403 })
     }
-    return data === -1 ? ('limited' as const) : ('ok' as const)
-  }
 
-  // 3. Rate limit. A signed httpOnly cookie identifies the visitor so distinct
-  //    people behind one NAT don't block each other. But because anyone can mint
-  //    a fresh cookie, we ALSO enforce a per-IP ceiling that cookie rotation
-  //    can't escape — both buckets must have room. Cookieless clients collapse
-  //    to a single, stricter IP bucket.
-  const visitorId = await verifyVisitorCookie(request.cookies.get('lid')?.value)
-  const ipIdentity = await hashIdentity(`ip:${ip}`)
+    // Atomic rate-limit check (advisory-locked count + insert): -1 if over.
+    const checkLimit = async (identity: string, limit: number) => {
+      const { data, error } = await supabase.rpc('check_and_log_attempt', {
+        p_identity: identity,
+        p_limit: limit,
+        p_window_hours: WINDOW_HOURS,
+      })
+      if (error) {
+        console.error('[lookup] rate-limit check failed:', error.message)
+        return 'error' as const
+      }
+      return data === -1 ? ('limited' as const) : ('ok' as const)
+    }
 
-  if (visitorId) {
-    const ipResult = await checkLimit(ipIdentity, IP_RATE_LIMIT)
-    if (ipResult === 'error') return NextResponse.json({ error: 'server' }, { status: 500 })
-    if (ipResult === 'limited') return NextResponse.json({ rate_limited: true }, { status: 429 })
+    // A signed httpOnly cookie identifies the visitor so distinct people behind
+    // one NAT don't block each other. Because anyone can mint a fresh cookie, we
+    // ALSO enforce a per-IP ceiling that cookie rotation can't escape — both must
+    // have room. Cookieless clients collapse to a single, stricter IP bucket.
+    const visitorId = await verifyVisitorCookie(request.cookies.get('lid')?.value)
+    const ipIdentity = await hashIdentity(`ip:${ip}`)
+    if (visitorId) {
+      const ipResult = await checkLimit(ipIdentity, IP_RATE_LIMIT)
+      if (ipResult === 'error') return NextResponse.json({ error: 'server' }, { status: 500 })
+      if (ipResult === 'limited') return NextResponse.json({ rate_limited: true }, { status: 429 })
 
-    const userResult = await checkLimit(await hashIdentity(`v:${visitorId}`), RATE_LIMIT)
-    if (userResult === 'error') return NextResponse.json({ error: 'server' }, { status: 500 })
-    if (userResult === 'limited') return NextResponse.json({ rate_limited: true }, { status: 429 })
+      const userResult = await checkLimit(await hashIdentity(`v:${visitorId}`), RATE_LIMIT)
+      if (userResult === 'error') return NextResponse.json({ error: 'server' }, { status: 500 })
+      if (userResult === 'limited') return NextResponse.json({ rate_limited: true }, { status: 429 })
+    } else {
+      const result = await checkLimit(ipIdentity, RATE_LIMIT)
+      if (result === 'error') return NextResponse.json({ error: 'server' }, { status: 500 })
+      if (result === 'limited') return NextResponse.json({ rate_limited: true }, { status: 429 })
+    }
   } else {
-    const result = await checkLimit(ipIdentity, RATE_LIMIT)
-    if (result === 'error') return NextResponse.json({ error: 'server' }, { status: 500 })
-    if (result === 'limited') return NextResponse.json({ rate_limited: true }, { status: 429 })
+    const tok = await verifyLookupToken(token, cleanUrl)
+    if (!tok.valid || !tok.nonce) {
+      return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+    }
+    const { data: fresh, error: nonceErr } = await supabase.rpc('consume_nonce', {
+      p_nonce: tok.nonce,
+    })
+    if (nonceErr) {
+      console.error('[lookup] nonce consume failed:', nonceErr.message)
+      return NextResponse.json({ error: 'server' }, { status: 500 })
+    }
+    if (!fresh) {
+      // Token already redeemed (replay).
+      return NextResponse.json({ error: 'forbidden' }, { status: 403 })
+    }
   }
 
-  // 4. Reserve budget headroom atomically BEFORE spending. Each in-flight lookup
-  //    books its worst-case cost under a lock, so a burst of concurrent requests
-  //    can't all read the same pre-spend total and collectively blow the cap.
-  //    The reservation is reconciled to the real amount once providers return.
+  // 3. Reserve this phase's worst-case cost atomically BEFORE spending, so a
+  //    burst of concurrent requests can't read the same pre-spend total and
+  //    collectively blow the cap. Reconciled to the real amount below.
+  const phaseCost =
+    phase === 1 ? COST.ocean + COST.aviato + COST.apollo : phase === 2 ? COST.bytemine : COST.contactout
   const { data: reservationId, error: resErr } = await supabase.rpc('reserve_spend', {
     p_window_hours: WINDOW_HOURS,
     p_budget_cents: DAILY_BUDGET_CENTS,
-    p_reserve_cents: MAX_COST_CENTS,
+    p_reserve_cents: phaseCost,
   })
   if (resErr) {
     console.error('[lookup] budget reservation failed:', resErr.message)
@@ -395,74 +407,69 @@ async function handleLookup(request: NextRequest) {
     return NextResponse.json({ at_capacity: true }, { status: 503 })
   }
 
-  // 5. Tier 1 — three cheap providers in parallel ($0.01 each). First email
-  //    wins; Apollo and Ocean also supply the profile card (Ocean takes the
-  //    bare handle, the others the full URL).
-  const handle = cleanUrl.split('/in/')[1]
-  const t1 = Math.min(TIER1_TIMEOUT_MS, timeLeft())
-  const [oceanR, aviatoR, apolloR] = await Promise.all([
-    tryOcean(handle, t1),
-    tryAviato(cleanUrl, t1),
-    tryApollo(cleanUrl, t1),
-  ])
-
+  // 4. Run this phase's providers, each with (near) the full 10s function budget.
+  let emails: string[] = []
+  let profile: Profile | undefined
+  let verified = false
   let spent = 0
   const providers: string[] = []
-  if (oceanR.ok) {
-    spent += COST.ocean
-    providers.push('ocean')
-  }
-  if (aviatoR.ok) {
-    spent += COST.aviato
-    providers.push('aviato')
-  }
-  if (apolloR.ok) {
-    spent += COST.apollo
-    providers.push('apollo')
-  }
+  let anyOk = false
 
-  // Field-level merge so each provider fills what it knows best (Apollo photo,
-  // Ocean company card, etc.).
-  let profile = mergeProfiles(apolloR.profile, oceanR.profile)
-  // Aviato lists work emails first, so keep its order ahead of the singletons.
-  let emails = Array.from(
-    new Set([...aviatoR.emails, oceanR.email, apolloR.email].filter(Boolean) as string[])
-  )
-  // Track which specific emails a provider vouched for, so the "verified" badge
-  // only attaches to an address we actually have a deliverability signal on.
-  const verifiedEmails = new Set<string>()
-  if (apolloR.verified && apolloR.email) verifiedEmails.add(apolloR.email)
-
-  // 6. Tier 2 — Bytemine ($0.03), only if the cheap tier found nothing and we
-  //    still have meaningful time left in the budget.
-  let bytemineOk = false
-  if (emails.length === 0 && timeLeft() > MIN_CALL_MS) {
+  if (phase === 1) {
+    // Three cheap providers in parallel ($0.01 each). Apollo and Ocean also
+    // supply the profile card (Ocean takes the bare handle, the others the URL).
+    const handle = cleanUrl.split('/in/')[1]
+    const cap = Math.min(TIER1_TIMEOUT_MS, timeLeft())
+    const [oceanR, aviatoR, apolloR] = await Promise.all([
+      tryOcean(handle, cap),
+      tryAviato(cleanUrl, cap),
+      tryApollo(cleanUrl, cap),
+    ])
+    if (oceanR.ok) {
+      spent += COST.ocean
+      providers.push('ocean')
+      anyOk = true
+    }
+    if (aviatoR.ok) {
+      spent += COST.aviato
+      providers.push('aviato')
+      anyOk = true
+    }
+    if (apolloR.ok) {
+      spent += COST.apollo
+      providers.push('apollo')
+      anyOk = true
+    }
+    profile = mergeProfiles(apolloR.profile, oceanR.profile)
+    // Aviato lists work emails first, so keep its order ahead of the singletons.
+    emails = Array.from(
+      new Set([...aviatoR.emails, oceanR.email, apolloR.email].filter(Boolean) as string[])
+    )
+    // The badge applies only to the displayed email, and only Apollo vouches in
+    // this phase.
+    if (apolloR.verified && apolloR.email && emails[0] === apolloR.email) verified = true
+  } else if (phase === 2) {
     const bm = await tryBytemine(cleanUrl, Math.min(TIER2_TIMEOUT_MS, timeLeft()))
-    bytemineOk = bm.ok
     if (bm.ok) {
       spent += COST.bytemine
       providers.push('bytemine')
+      anyOk = true
     }
-    if (bm.emails.length > 0) emails = bm.emails
-    if (bm.verified && bm.emails[0]) verifiedEmails.add(bm.emails[0])
-    profile = mergeProfiles(profile, bm.profile)
-  }
-
-  // 7. Tier 3 — ContactOut ($0.33), last resort — only if time remains.
-  let contactOutOk = false
-  if (emails.length === 0 && timeLeft() > MIN_CALL_MS) {
+    emails = bm.emails
+    profile = bm.profile
+    if (bm.verified && bm.emails[0]) verified = true
+  } else {
     const co = await tryContactOut(cleanUrl, Math.min(TIER3_TIMEOUT_MS, timeLeft()))
-    contactOutOk = co.ok
     if (co.ok) {
       spent += COST.contactout
       providers.push('contactout')
+      anyOk = true
     }
-    if (co.emails.length > 0) emails = co.emails
+    emails = co.emails
   }
 
-  // 8. Reconcile the up-front reservation to what we actually spent (0 if every
-  //    provider failed). Best-effort — a stale reservation just ages out of the
-  //    24h window, erring on the safe side of the budget.
+  // 5. Reconcile the reservation to what we actually spent (0 if the provider
+  //    failed). Best-effort — a stale reservation just ages out of the window.
   const { error: reconErr } = await supabase.rpc('reconcile_spend', {
     p_id: reservationId,
     p_cost_cents: spent,
@@ -470,19 +477,19 @@ async function handleLookup(request: NextRequest) {
   })
   if (reconErr) console.error('[lookup] spend reconcile failed:', reconErr.message)
 
+  // 6. Respond.
   if (emails.length > 0) {
-    // The badge applies to the primary (displayed) email only.
-    const verified = verifiedEmails.has(emails[0])
     return NextResponse.json({ emails, profile, verified })
   }
-
-  // 9. Distinguish a genuine miss from a system failure. If every provider we
-  //    called errored, this is our problem, not "hard to find".
-  const anyProviderResponded =
-    oceanR.ok || aviatoR.ok || apolloR.ok || bytemineOk || contactOutOk
-  if (!anyProviderResponded) {
+  if (phase < 3) {
+    // No email yet — hand the client a fresh single-use token for the next tier,
+    // and pass along any profile we gathered so it can accumulate across phases.
+    const { token: nextToken } = await signLookupToken(cleanUrl)
+    return NextResponse.json({ continue: true, phase: phase + 1, token: nextToken, profile })
+  }
+  // Phase 3 miss: distinguish a genuine "not found" from a provider failure.
+  if (!anyOk) {
     return NextResponse.json({ error: 'server' }, { status: 502 })
   }
-
   return NextResponse.json({ not_found: true })
 }
