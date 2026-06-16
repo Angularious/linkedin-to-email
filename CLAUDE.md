@@ -27,6 +27,11 @@ redeems `token` on the next call and accumulates `profile` across phases. A hit
 returns `{ emails, profile, verified }`; terminal states are `not_found` /
 `at_capacity` / `rate_limited` / `invalid` / `error`.
 
+A provider HTTP **404 = "no record for this profile"** — a clean miss, not a
+failure and not billable. `callOrthogonal` flags it as `notFound`, so it counts
+as "responded" (→ `not_found`, never a 502) but is charged $0. Only true errors
+(timeout / 5xx / network) leave a phase with no responder and yield `error`/502.
+
 Worst-case cost ~$0.36, but expected cost is low: three $0.01 sources resolve most
 profiles before Bytemine/ContactOut are paid for. Full-miss wall-clock is up to
 ~3×10s, surfaced via "checking deeper / premium sources…" messaging.

@@ -66,7 +66,7 @@ async function callOrthogonal(
   params: Record<string, unknown>,
   httpMethod: 'GET' | 'POST' = 'POST',
   timeoutMs: number = TIER1_TIMEOUT_MS
-): Promise<{ ok: boolean; data: unknown }> {
+): Promise<{ ok: boolean; notFound: boolean; data: unknown }> {
   try {
     const res = await fetchWithTimeout(
       ORTHOGONAL_URL,
@@ -84,15 +84,21 @@ async function callOrthogonal(
       },
       timeoutMs
     )
+    // 404 = the provider has no record for this profile. That's a clean miss,
+    // not a system failure — and not a billable call — so surface it distinctly:
+    // the route counts it as "responded" (→ not_found, not a 502) but charges $0.
+    if (res.status === 404) {
+      return { ok: false, notFound: true, data: null }
+    }
     if (!res.ok) {
       console.error(`[orthogonal] ${api}${path} → HTTP ${res.status}`)
-      return { ok: false, data: null }
+      return { ok: false, notFound: false, data: null }
     }
     const json = await res.json()
-    return { ok: true, data: (json as { data?: unknown })?.data ?? json }
+    return { ok: true, notFound: false, data: (json as { data?: unknown })?.data ?? json }
   } catch (err) {
     console.error(`[orthogonal] ${api}${path} → ${(err as Error).name}`)
-    return { ok: false, data: null }
+    return { ok: false, notFound: false, data: null }
   }
 }
 
@@ -127,8 +133,8 @@ function mergeProfiles(...parts: Array<Profile | undefined>): Profile | undefine
 async function tryOcean(
   handle: string,
   timeoutMs: number
-): Promise<{ ok: boolean; email: string | null; profile?: Profile }> {
-  const { ok, data } = await callOrthogonal(
+): Promise<{ ok: boolean; responded: boolean; email: string | null; profile?: Profile }> {
+  const { ok, notFound, data } = await callOrthogonal(
     'ocean-io',
     '/v2/lookup/people',
     {
@@ -138,8 +144,9 @@ async function tryOcean(
     'POST',
     timeoutMs
   )
+  const responded = ok || notFound
   const person = (data as { people?: Array<Record<string, unknown>> } | null)?.people?.[0]
-  if (!person) return { ok, email: null }
+  if (!person) return { ok, responded, email: null }
 
   // `email` may come back as a string or as an { address } object.
   const emailField = person.email as { address?: string } | string | undefined
@@ -159,41 +166,43 @@ async function tryOcean(
     companyIndustry: company?.industries?.[0] ?? undefined,
     photoUrl: (person.photo as string) ?? undefined,
   }
-  return { ok, email, profile: profile.name || profile.title ? profile : undefined }
+  return { ok, responded, email, profile: profile.name || profile.title ? profile : undefined }
 }
 
 // Aviato returns a typed email list; work emails are preferred (work finder).
 async function tryAviato(
   linkedinUrl: string,
   timeoutMs: number
-): Promise<{ ok: boolean; emails: string[] }> {
-  const { ok, data } = await callOrthogonal(
+): Promise<{ ok: boolean; responded: boolean; emails: string[] }> {
+  const { ok, notFound, data } = await callOrthogonal(
     'aviato',
     '/person/contact-info',
     { linkedinURL: linkedinUrl },
     'GET',
     timeoutMs
   )
+  const responded = ok || notFound
   const list = (data as { emails?: Array<{ email?: string; type?: string }> } | null)?.emails
-  if (!Array.isArray(list)) return { ok, emails: [] }
+  if (!Array.isArray(list)) return { ok, responded, emails: [] }
   const work = list.filter((e) => e.type === 'work').map((e) => e.email)
   const other = list.filter((e) => e.type !== 'work').map((e) => e.email)
-  return { ok, emails: Array.from(new Set([...work, ...other].filter(Boolean) as string[])) }
+  return { ok, responded, emails: Array.from(new Set([...work, ...other].filter(Boolean) as string[])) }
 }
 
 async function tryApollo(
   linkedinUrl: string,
   timeoutMs: number
-): Promise<{ ok: boolean; email: string | null; verified: boolean; profile?: Profile }> {
-  const { ok, data } = await callOrthogonal(
+): Promise<{ ok: boolean; responded: boolean; email: string | null; verified: boolean; profile?: Profile }> {
+  const { ok, notFound, data } = await callOrthogonal(
     'apollo',
     '/api/v1/people/match',
     { linkedin_url: linkedinUrl, reveal_personal_emails: false },
     'POST',
     timeoutMs
   )
+  const responded = ok || notFound
   const person = (data as { person?: Record<string, unknown> } | null)?.person
-  if (!person) return { ok, email: null, verified: false }
+  if (!person) return { ok, responded, email: null, verified: false }
 
   const org = person.organization as { name?: string; logo_url?: string } | undefined
   const location =
@@ -212,6 +221,7 @@ async function tryApollo(
 
   return {
     ok,
+    responded,
     email: (person.email as string) || null,
     // Apollo tags each email: "verified" | "guessed" | "unavailable" | null.
     verified: (person.email_status as string) === 'verified',
@@ -222,20 +232,21 @@ async function tryApollo(
 async function tryContactOut(
   linkedinUrl: string,
   timeoutMs: number
-): Promise<{ ok: boolean; emails: string[] }> {
-  const { ok, data } = await callOrthogonal(
+): Promise<{ ok: boolean; responded: boolean; emails: string[] }> {
+  const { ok, notFound, data } = await callOrthogonal(
     'contactout',
     '/v1/people/linkedin',
     { profile: linkedinUrl },
     'GET',
     timeoutMs
   )
+  const responded = ok || notFound
   const p = (data as { profile?: { work_email?: string[]; email?: string[] } } | null)?.profile
-  if (!p) return { ok, emails: [] }
+  if (!p) return { ok, responded, emails: [] }
   // Work emails first — this is a work-email finder.
   const workEmails = Array.isArray(p.work_email) ? p.work_email : []
   const anyEmails = Array.isArray(p.email) ? p.email : []
-  return { ok, emails: Array.from(new Set([...workEmails, ...anyEmails])).filter(Boolean) }
+  return { ok, responded, emails: Array.from(new Set([...workEmails, ...anyEmails])).filter(Boolean) }
 }
 
 // Bytemine: cheap-ish ($0.03) mid-tier. Returns a verified work email plus
@@ -243,16 +254,17 @@ async function tryContactOut(
 async function tryBytemine(
   linkedinUrl: string,
   timeoutMs: number
-): Promise<{ ok: boolean; emails: string[]; verified: boolean; profile?: Profile }> {
-  const { ok, data } = await callOrthogonal(
+): Promise<{ ok: boolean; responded: boolean; emails: string[]; verified: boolean; profile?: Profile }> {
+  const { ok, notFound, data } = await callOrthogonal(
     'bytemine',
     '/contacts/enrich',
     { linkedin: linkedinUrl },
     'POST',
     timeoutMs
   )
+  const responded = ok || notFound
   const d = data as Record<string, unknown> | null
-  if (!d) return { ok, emails: [], verified: false }
+  if (!d) return { ok, responded, emails: [], verified: false }
 
   const work = (d.work_email as string) || (d.email as string) || null
   const personal = (d.personal_email as string) || null
@@ -273,7 +285,7 @@ async function tryBytemine(
     companyIndustry: (d.company_industry as string) ?? undefined,
     companySize: (d.company_employee_range as string) ?? undefined,
   }
-  return { ok, emails, verified, profile: profile.name || profile.title ? profile : undefined }
+  return { ok, responded, emails, verified, profile: profile.name || profile.title ? profile : undefined }
 }
 
 export async function POST(request: NextRequest) {
@@ -428,18 +440,19 @@ async function handleLookup(request: NextRequest) {
     if (oceanR.ok) {
       spent += COST.ocean
       providers.push('ocean')
-      anyOk = true
     }
     if (aviatoR.ok) {
       spent += COST.aviato
       providers.push('aviato')
-      anyOk = true
     }
     if (apolloR.ok) {
       spent += COST.apollo
       providers.push('apollo')
-      anyOk = true
     }
+    // "Responded" includes a clean 404 (no data) — only a true error (timeout /
+    // 5xx / network) leaves it false, which is what distinguishes not_found from
+    // a 502.
+    anyOk = oceanR.responded || aviatoR.responded || apolloR.responded
     profile = mergeProfiles(apolloR.profile, oceanR.profile)
     // Aviato lists work emails first, so keep its order ahead of the singletons.
     emails = Array.from(
@@ -453,8 +466,8 @@ async function handleLookup(request: NextRequest) {
     if (bm.ok) {
       spent += COST.bytemine
       providers.push('bytemine')
-      anyOk = true
     }
+    anyOk = bm.responded
     emails = bm.emails
     profile = bm.profile
     if (bm.verified && bm.emails[0]) verified = true
@@ -463,8 +476,8 @@ async function handleLookup(request: NextRequest) {
     if (co.ok) {
       spent += COST.contactout
       providers.push('contactout')
-      anyOk = true
     }
+    anyOk = co.responded
     emails = co.emails
   }
 
