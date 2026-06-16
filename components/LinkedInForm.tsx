@@ -16,7 +16,12 @@ type UIState =
 interface Profile {
   name?: string
   title?: string
+  headline?: string
+  location?: string
   company?: string
+  companyLogo?: string
+  companySize?: string
+  companyIndustry?: string
   photoUrl?: string
 }
 
@@ -26,6 +31,7 @@ export default function LinkedInForm() {
   const [url, setUrl] = useState('')
   const [uiState, setUiState] = useState<UIState>('idle')
   const [emails, setEmails] = useState<string[]>([])
+  const [verified, setVerified] = useState(false)
   const [profile, setProfile] = useState<Profile | null>(null)
   const [showDropdown, setShowDropdown] = useState(false)
   const [copiedIdx, setCopiedIdx] = useState<number | null>(null)
@@ -124,6 +130,7 @@ export default function LinkedInForm() {
 
       if (data.emails?.length > 0) {
         setEmails(data.emails)
+        setVerified(!!data.verified)
         setProfile(data.profile ?? null)
         setUiState('success')
       } else if (data.rate_limited) {
@@ -244,7 +251,21 @@ export default function LinkedInForm() {
                   {/* Primary email row */}
                   <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
                     <Image src="/check.svg" width={32} height={24} alt="found" style={{ flexShrink: 0 }} />
-                    <span style={{ flex: 1, wordBreak: 'break-all' }}>{emails[0]}</span>
+                    <span style={{ flex: 1, wordBreak: 'break-all' }}>
+                      {emails[0]}
+                      {verified && (
+                        <span
+                          title="Deliverability verified"
+                          style={{
+                            marginLeft: '8px', fontSize: '13px', color: '#2e7d32',
+                            border: '1px solid #2e7d32', borderRadius: '10px',
+                            padding: '1px 7px', whiteSpace: 'nowrap',
+                          }}
+                        >
+                          ✓ verified
+                        </span>
+                      )}
+                    </span>
                     <button
                       onClick={() => handleCopy(emails[0], 0)}
                       style={{
@@ -318,6 +339,24 @@ export default function LinkedInForm() {
                             {(profile.title || profile.company) && (
                               <span style={{ fontSize: '14px', color: '#888' }}>
                                 {[profile.title, profile.company].filter(Boolean).join(' @ ')}
+                              </span>
+                            )}
+                            {profile.location && (
+                              <span style={{ fontSize: '13px', color: '#aaa' }}>📍 {profile.location}</span>
+                            )}
+                            {(profile.companySize || profile.companyIndustry) && (
+                              <span style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', color: '#aaa', marginTop: '2px' }}>
+                                {profile.companyLogo && (
+                                  // eslint-disable-next-line @next/next/no-img-element
+                                  <img
+                                    src={profile.companyLogo}
+                                    alt={profile.company ?? ''}
+                                    width={16}
+                                    height={16}
+                                    style={{ borderRadius: '3px', flexShrink: 0, objectFit: 'contain' }}
+                                  />
+                                )}
+                                {[profile.companyIndustry, profile.companySize && `${profile.companySize} employees`].filter(Boolean).join(' · ')}
                               </span>
                             )}
                           </div>

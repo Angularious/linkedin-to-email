@@ -8,12 +8,13 @@ const ORTHOGONAL_URL = 'https://api.orthogonal.com/v1/run'
 const RATE_LIMIT = 3
 const WINDOW_HOURS = 24
 
-// Vercel Hobby kills a function at 10s. The slow path runs two provider phases
-// sequentially — (Tomba ∥ Apollo) then ContactOut — so their timeouts must sum
-// to well under 10s (plus bot check + DB overhead) or Vercel returns a platform
-// 504 instead of our clean JSON. 3.5s + 5s + ~1s ≈ 9.5s worst case.
-const FAST_TIMEOUT_MS = 3500 // Tomba, Apollo (cheap, fast)
-const SLOW_TIMEOUT_MS = 5000 // ContactOut (expensive — give the paid call room)
+// Vercel Hobby kills a function at 10s. The slow path runs three provider phases
+// sequentially — (Ocean ∥ Aviato ∥ Apollo) → Bytemine → ContactOut — so their
+// timeouts must sum to well under 10s (plus bot check + DB overhead) or Vercel
+// returns a platform 504 instead of our clean JSON. 3s + 2.5s + 3s + ~1s ≈ 9.5s.
+const FAST_TIMEOUT_MS = 3000 // Tier 1: Ocean, Aviato, Apollo (cheap, parallel)
+const MID_TIMEOUT_MS = 2500 // Tier 2: Bytemine (cheap-ish fallback)
+const SLOW_TIMEOUT_MS = 3000 // Tier 3: ContactOut (expensive — last resort)
 
 // Cap the function at the Hobby maximum explicitly.
 export const maxDuration = 10
@@ -24,8 +25,9 @@ export const maxDuration = 10
 const DAILY_BUDGET_CENTS = Number(process.env.DAILY_BUDGET_CENTS ?? 2500)
 
 // Per-provider cost in cents (Orthogonal charges on a successful HTTP call,
-// regardless of whether an email was found).
-const COST = { tomba: 1, apollo: 1, contactout: 33 }
+// regardless of whether an email was found). Ocean bills ~$0.0045 in practice;
+// rounded up to 1¢ so the budget cap errs high.
+const COST = { ocean: 1, apollo: 1, aviato: 1, bytemine: 3, contactout: 33 }
 
 // Normalize any LinkedIn URL variant to https://www.linkedin.com/in/slug
 function cleanLinkedInUrl(input: string): string | null {
@@ -86,38 +88,107 @@ async function callOrthogonal(
 interface Profile {
   name?: string
   title?: string
+  headline?: string
+  location?: string
   company?: string
+  companyLogo?: string
+  companySize?: string
+  companyIndustry?: string
   photoUrl?: string
 }
 
-async function tryTomba(linkedinUrl: string): Promise<{ ok: boolean; email: string | null }> {
-  const { ok, data } = await callOrthogonal('tomba', '/v1/linkedin', { url: linkedinUrl }, 'GET')
-  const d = data as { data?: { email?: string }; email?: string } | null
-  const email = d?.data?.email ?? d?.email ?? null
-  return { ok, email: email || null }
+// Merge partial profiles in priority order: the first provider with a value for
+// a given field wins. Lets Apollo supply the photo while Ocean fills the company
+// card and Bytemine backfills anything still missing.
+function mergeProfiles(...parts: Array<Profile | undefined>): Profile | undefined {
+  const merged: Profile = {}
+  for (const p of parts) {
+    if (!p) continue
+    for (const k of Object.keys(p) as (keyof Profile)[]) {
+      if (merged[k] === undefined && p[k] !== undefined) merged[k] = p[k]
+    }
+  }
+  return Object.keys(merged).length ? merged : undefined
+}
+
+// Ocean.io takes the bare profile handle (slug), not the full URL. Batch
+// endpoint: one handle in, people[0] out. Supplies a full profile incl. photo.
+async function tryOcean(
+  handle: string
+): Promise<{ ok: boolean; email: string | null; profile?: Profile }> {
+  const { ok, data } = await callOrthogonal('ocean-io', '/v2/lookup/people', {
+    linkedinHandles: [handle],
+    fields: ['name', 'jobTitle', 'headline', 'location', 'photo', 'email', 'email.address'],
+  })
+  const person = (data as { people?: Array<Record<string, unknown>> } | null)?.people?.[0]
+  if (!person) return { ok, email: null }
+
+  // `email` may come back as a string or as an { address } object.
+  const emailField = person.email as { address?: string } | string | undefined
+  const email = (typeof emailField === 'string' ? emailField : emailField?.address) || null
+
+  const company = person.company as
+    | { name?: string; logo?: string; companySize?: string; industries?: string[] }
+    | undefined
+  const profile: Profile = {
+    name: (person.name as string) ?? undefined,
+    title: (person.jobTitle as string) ?? undefined,
+    headline: (person.headline as string) ?? undefined,
+    location: (person.location as string) ?? undefined,
+    company: company?.name ?? undefined,
+    companyLogo: company?.logo ?? undefined,
+    companySize: company?.companySize ?? undefined,
+    companyIndustry: company?.industries?.[0] ?? undefined,
+    photoUrl: (person.photo as string) ?? undefined,
+  }
+  return { ok, email, profile: profile.name || profile.title ? profile : undefined }
+}
+
+// Aviato returns a typed email list; work emails are preferred (work finder).
+async function tryAviato(linkedinUrl: string): Promise<{ ok: boolean; emails: string[] }> {
+  const { ok, data } = await callOrthogonal(
+    'aviato',
+    '/person/contact-info',
+    { linkedinURL: linkedinUrl },
+    'GET'
+  )
+  const list = (data as { emails?: Array<{ email?: string; type?: string }> } | null)?.emails
+  if (!Array.isArray(list)) return { ok, emails: [] }
+  const work = list.filter((e) => e.type === 'work').map((e) => e.email)
+  const other = list.filter((e) => e.type !== 'work').map((e) => e.email)
+  return { ok, emails: Array.from(new Set([...work, ...other].filter(Boolean) as string[])) }
 }
 
 async function tryApollo(
   linkedinUrl: string
-): Promise<{ ok: boolean; email: string | null; profile?: Profile }> {
+): Promise<{ ok: boolean; email: string | null; verified: boolean; profile?: Profile }> {
   const { ok, data } = await callOrthogonal('apollo', '/api/v1/people/match', {
     linkedin_url: linkedinUrl,
     reveal_personal_emails: false,
   })
   const person = (data as { person?: Record<string, unknown> } | null)?.person
-  if (!person) return { ok, email: null }
+  if (!person) return { ok, email: null, verified: false }
 
-  const org = person.organization as { name?: string } | undefined
+  const org = person.organization as { name?: string; logo_url?: string } | undefined
+  const location =
+    [person.city as string, (person.state as string) || (person.country as string)]
+      .filter(Boolean)
+      .join(', ') || undefined
   const profile: Profile = {
     name: (person.name as string) ?? undefined,
     title: (person.title as string) ?? undefined,
+    headline: (person.headline as string) ?? undefined,
+    location,
     company: org?.name ?? undefined,
+    companyLogo: org?.logo_url ?? undefined,
     photoUrl: (person.photo_url as string) ?? undefined,
   }
 
   return {
     ok,
     email: (person.email as string) || null,
+    // Apollo tags each email: "verified" | "guessed" | "unavailable" | null.
+    verified: (person.email_status as string) === 'verified',
     profile: profile.name || profile.title ? profile : undefined,
   }
 }
@@ -136,6 +207,43 @@ async function tryContactOut(linkedinUrl: string): Promise<{ ok: boolean; emails
   const workEmails = Array.isArray(p.work_email) ? p.work_email : []
   const anyEmails = Array.isArray(p.email) ? p.email : []
   return { ok, emails: Array.from(new Set([...workEmails, ...anyEmails])).filter(Boolean) }
+}
+
+// Bytemine: cheap-ish ($0.03) mid-tier. Returns a verified work email plus
+// profile data (no photo), so it can also backfill the card if Ocean/Apollo miss.
+async function tryBytemine(
+  linkedinUrl: string
+): Promise<{ ok: boolean; emails: string[]; verified: boolean; profile?: Profile }> {
+  const { ok, data } = await callOrthogonal(
+    'bytemine',
+    '/contacts/enrich',
+    { linkedin: linkedinUrl },
+    'POST',
+    MID_TIMEOUT_MS
+  )
+  const d = data as Record<string, unknown> | null
+  if (!d) return { ok, emails: [], verified: false }
+
+  const work = (d.work_email as string) || (d.email as string) || null
+  const personal = (d.personal_email as string) || null
+  const emails = Array.from(new Set([work, personal].filter(Boolean) as string[]))
+
+  // Bytemine runs an SMTP check on the work email and reports the result.
+  const ef = d.email_finder as { smtp_result?: string; confidence?: string } | undefined
+  const verified = ef?.smtp_result === 'valid' || ef?.confidence === 'high'
+
+  const location =
+    [d.person_city as string, d.person_state as string].filter(Boolean).join(', ') || undefined
+  const profile: Profile = {
+    name: (d.full_name as string) ?? undefined,
+    title: (d.job_title as string) ?? undefined,
+    headline: (d.linkedin_headline as string) ?? undefined,
+    location,
+    company: (d.company_name as string) ?? undefined,
+    companyIndustry: (d.company_industry as string) ?? undefined,
+    companySize: (d.company_employee_range as string) ?? undefined,
+  }
+  return { ok, emails, verified, profile: profile.name || profile.title ? profile : undefined }
 }
 
 export async function POST(request: NextRequest) {
@@ -226,20 +334,58 @@ async function handleLookup(request: NextRequest) {
     return NextResponse.json({ rate_limited: true }, { status: 429 })
   }
 
-  // 5. Tomba + Apollo in parallel ($0.01 each)
-  const [tombaR, apolloR] = await Promise.all([tryTomba(cleanUrl), tryApollo(cleanUrl)])
+  // 5. Tier 1 — three cheap providers in parallel ($0.01 each). First email
+  //    wins; Apollo and Ocean also supply the profile card (Ocean takes the
+  //    bare handle, the others the full URL).
+  const handle = cleanUrl.split('/in/')[1]
+  const [oceanR, aviatoR, apolloR] = await Promise.all([
+    tryOcean(handle),
+    tryAviato(cleanUrl),
+    tryApollo(cleanUrl),
+  ])
 
-  let spent = (tombaR.ok ? COST.tomba : 0) + (apolloR.ok ? COST.apollo : 0)
+  let spent = 0
   const providers: string[] = []
-  if (tombaR.ok) providers.push('tomba')
-  if (apolloR.ok) providers.push('apollo')
+  if (oceanR.ok) {
+    spent += COST.ocean
+    providers.push('ocean')
+  }
+  if (aviatoR.ok) {
+    spent += COST.aviato
+    providers.push('aviato')
+  }
+  if (apolloR.ok) {
+    spent += COST.apollo
+    providers.push('apollo')
+  }
 
-  const profile = apolloR.profile
+  // Field-level merge so each provider fills what it knows best (Apollo photo,
+  // Ocean company card, etc.).
+  let profile = mergeProfiles(apolloR.profile, oceanR.profile)
+  // Aviato lists work emails first, so keep its order ahead of the singletons.
   let emails = Array.from(
-    new Set([tombaR.email, apolloR.email].filter(Boolean) as string[])
+    new Set([...aviatoR.emails, oceanR.email, apolloR.email].filter(Boolean) as string[])
   )
+  // Track which specific emails a provider vouched for, so the "verified" badge
+  // only attaches to an address we actually have a deliverability signal on.
+  const verifiedEmails = new Set<string>()
+  if (apolloR.verified && apolloR.email) verifiedEmails.add(apolloR.email)
 
-  // 6. ContactOut fallback ($0.33) only if the cheap providers found nothing
+  // 6. Tier 2 — Bytemine ($0.03), only if the cheap tier found nothing.
+  let bytemineOk = false
+  if (emails.length === 0) {
+    const bm = await tryBytemine(cleanUrl)
+    bytemineOk = bm.ok
+    if (bm.ok) {
+      spent += COST.bytemine
+      providers.push('bytemine')
+    }
+    if (bm.emails.length > 0) emails = bm.emails
+    if (bm.verified && bm.emails[0]) verifiedEmails.add(bm.emails[0])
+    profile = mergeProfiles(profile, bm.profile)
+  }
+
+  // 7. Tier 3 — ContactOut ($0.33), last resort.
   let contactOutOk = false
   if (emails.length === 0) {
     const co = await tryContactOut(cleanUrl)
@@ -251,7 +397,7 @@ async function handleLookup(request: NextRequest) {
     if (co.emails.length > 0) emails = co.emails
   }
 
-  // 7. Record spend (best-effort; the global cap is the real guard)
+  // 8. Record spend (best-effort; the global cap is the real guard)
   if (spent > 0) {
     const { error } = await supabase
       .from('spend_log')
@@ -260,12 +406,15 @@ async function handleLookup(request: NextRequest) {
   }
 
   if (emails.length > 0) {
-    return NextResponse.json({ emails, profile })
+    // The badge applies to the primary (displayed) email only.
+    const verified = verifiedEmails.has(emails[0])
+    return NextResponse.json({ emails, profile, verified })
   }
 
-  // 8. Distinguish a genuine miss from a system failure. If every provider we
+  // 9. Distinguish a genuine miss from a system failure. If every provider we
   //    called errored, this is our problem, not "hard to find".
-  const anyProviderResponded = tombaR.ok || apolloR.ok || contactOutOk
+  const anyProviderResponded =
+    oceanR.ok || aviatoR.ok || apolloR.ok || bytemineOk || contactOutOk
   if (!anyProviderResponded) {
     return NextResponse.json({ error: 'server' }, { status: 502 })
   }

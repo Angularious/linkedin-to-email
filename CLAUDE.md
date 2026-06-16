@@ -7,19 +7,42 @@ so abuse/cost protection matters.
 ## Stack
 - Next.js 14 (App Router), deployed on Vercel
 - Supabase (Postgres) for rate limiting + spend tracking
-- Orthogonal REST API (`https://api.orthogonal.com/v1/run`) for the lookups
+- Orthogonal REST API (`https://api.orthogonal.com/v1/run`) for the lookups.
+  Providers: Ocean.io, Aviato, Apollo (cheap tier), Bytemine, ContactOut.
 - Hand-drawn UI via rough.js + Indie Flower font (inline styles)
 
 ## Lookup pipeline (`app/api/lookup/route.ts`)
 1. Clean + validate the LinkedIn URL (regex → canonical `/in/<slug>`)
 2. Global spend-cap check (reject with `at_capacity` if over budget)
 3. Atomic per-visitor rate limit (reject with `rate_limited` if over)
-4. **Tomba + Apollo in parallel** ($0.01 each). Apollo also returns profile data.
-5. **ContactOut** ($0.33) only if both miss — work emails preferred
-6. Record spend, return `{ emails, profile }` / `not_found` / `error`
+4. **Tier 1 — Ocean.io ∥ Aviato ∥ Apollo in parallel** ($0.01 each). Apollo and
+   Ocean also return profile data (incl. photo). Ocean takes the bare handle.
+5. **Tier 2 — Bytemine** ($0.03) only if Tier 1 misses. Also backfills profile.
+6. **Tier 3 — ContactOut** ($0.33), last resort — work emails preferred.
+7. Record spend, return `{ emails, profile }` / `not_found` / `error`
+
+Worst-case cost ~$0.36, but expected cost is low: three independent $0.01 sources
+resolve most profiles before Bytemine/ContactOut are ever paid for. Per-call
+timeouts (3s + 2.5s + 3s) sum under the 10s Hobby cap.
 
 Provider response shapes are unwrapped from Orthogonal's `{ data: ... }` envelope.
-GET endpoints (Tomba, ContactOut) pass params as `query`; POST (Apollo) as `body`.
+GET endpoints (Aviato, ContactOut) pass params as `query`; POST (Ocean, Apollo,
+Bytemine) as `body`. Email shapes: Aviato `emails[].{email,type}` (work first),
+Ocean `people[0].email(.address)`, Bytemine flat `work_email`/`email`.
+
+## Profile enrichment (free — same paid calls)
+The response also returns `profile` (merged field-by-field across providers via
+`mergeProfiles` — Apollo photo, Ocean company card, etc.) and a `verified` flag.
+`verified` is true only when the *displayed* email (`emails[0]`) carries a real
+deliverability signal — Apollo `email_status === 'verified'` (common path) or
+Bytemine `email_finder.smtp_result === 'valid'`/`confidence === 'high'` (fallback).
+The UI shows a "✓ verified" badge on the primary email plus location and a
+company line (logo · industry · size) in the "more info" dropdown.
+
+**Privacy decision (deliberate):** phone numbers, personal emails, salary, and age
+all come back in these payloads but are intentionally NOT surfaced — this is a
+public, no-login *work*-email finder. They're a natural "sign up to unlock" hook
+for the existing orthogonal.com CTAs, not free anonymous data.
 
 ## Protection model (4 layers, no Cloudflare)
 - **Bot detection** — Vercel BotID ('basic' free tier) guards POST `/api/lookup`.
