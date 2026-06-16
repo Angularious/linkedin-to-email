@@ -14,13 +14,17 @@ const RATE_LIMIT = 3 // per-visitor (signed cookie) lookups / 24h
 const IP_RATE_LIMIT = 30
 const WINDOW_HOURS = 24
 
-// Vercel Hobby kills a function at 10s. The slow path runs three provider phases
-// sequentially — (Ocean ∥ Aviato ∥ Apollo) → Bytemine → ContactOut — so their
-// timeouts must sum to well under 10s (plus bot check + DB overhead) or Vercel
-// returns a platform 504 instead of our clean JSON. 3s + 2.5s + 3s + ~1s ≈ 9.5s.
-const FAST_TIMEOUT_MS = 3000 // Tier 1: Ocean, Aviato, Apollo (cheap, parallel)
-const MID_TIMEOUT_MS = 2500 // Tier 2: Bytemine (cheap-ish fallback)
-const SLOW_TIMEOUT_MS = 3000 // Tier 3: ContactOut (expensive — last resort)
+// Vercel Hobby kills a function at 10s. Rather than give each provider phase a
+// fixed slice (too tight for cold starts — a 3s cap was aborting live Ocean
+// calls), we run against a wall-clock DEADLINE: every call gets the smaller of
+// its tier cap and the time left in the budget, and a tier is skipped if too
+// little headroom remains. The common path (Tier 1 hits) thus gets the full
+// generous window; only a full miss compresses the later tiers.
+const PROVIDER_BUDGET_MS = 8500 // total wall-clock for all provider phases (<10s cap)
+const MIN_CALL_MS = 800 // don't start a provider call with less headroom than this
+const TIER1_TIMEOUT_MS = 5000 // Ocean ∥ Aviato ∥ Apollo (parallel)
+const TIER2_TIMEOUT_MS = 3500 // Bytemine
+const TIER3_TIMEOUT_MS = 4000 // ContactOut
 
 // Cap the function at the Hobby maximum explicitly.
 export const maxDuration = 10
@@ -65,7 +69,7 @@ async function callOrthogonal(
   path: string,
   params: Record<string, unknown>,
   httpMethod: 'GET' | 'POST' = 'POST',
-  timeoutMs: number = FAST_TIMEOUT_MS
+  timeoutMs: number = TIER1_TIMEOUT_MS
 ): Promise<{ ok: boolean; data: unknown }> {
   try {
     const res = await fetchWithTimeout(
@@ -125,12 +129,19 @@ function mergeProfiles(...parts: Array<Profile | undefined>): Profile | undefine
 // Ocean.io takes the bare profile handle (slug), not the full URL. Batch
 // endpoint: one handle in, people[0] out. Supplies a full profile incl. photo.
 async function tryOcean(
-  handle: string
+  handle: string,
+  timeoutMs: number
 ): Promise<{ ok: boolean; email: string | null; profile?: Profile }> {
-  const { ok, data } = await callOrthogonal('ocean-io', '/v2/lookup/people', {
-    linkedinHandles: [handle],
-    fields: ['name', 'jobTitle', 'headline', 'location', 'photo', 'email', 'email.address'],
-  })
+  const { ok, data } = await callOrthogonal(
+    'ocean-io',
+    '/v2/lookup/people',
+    {
+      linkedinHandles: [handle],
+      fields: ['name', 'jobTitle', 'headline', 'location', 'photo', 'email', 'email.address'],
+    },
+    'POST',
+    timeoutMs
+  )
   const person = (data as { people?: Array<Record<string, unknown>> } | null)?.people?.[0]
   if (!person) return { ok, email: null }
 
@@ -156,12 +167,16 @@ async function tryOcean(
 }
 
 // Aviato returns a typed email list; work emails are preferred (work finder).
-async function tryAviato(linkedinUrl: string): Promise<{ ok: boolean; emails: string[] }> {
+async function tryAviato(
+  linkedinUrl: string,
+  timeoutMs: number
+): Promise<{ ok: boolean; emails: string[] }> {
   const { ok, data } = await callOrthogonal(
     'aviato',
     '/person/contact-info',
     { linkedinURL: linkedinUrl },
-    'GET'
+    'GET',
+    timeoutMs
   )
   const list = (data as { emails?: Array<{ email?: string; type?: string }> } | null)?.emails
   if (!Array.isArray(list)) return { ok, emails: [] }
@@ -171,12 +186,16 @@ async function tryAviato(linkedinUrl: string): Promise<{ ok: boolean; emails: st
 }
 
 async function tryApollo(
-  linkedinUrl: string
+  linkedinUrl: string,
+  timeoutMs: number
 ): Promise<{ ok: boolean; email: string | null; verified: boolean; profile?: Profile }> {
-  const { ok, data } = await callOrthogonal('apollo', '/api/v1/people/match', {
-    linkedin_url: linkedinUrl,
-    reveal_personal_emails: false,
-  })
+  const { ok, data } = await callOrthogonal(
+    'apollo',
+    '/api/v1/people/match',
+    { linkedin_url: linkedinUrl, reveal_personal_emails: false },
+    'POST',
+    timeoutMs
+  )
   const person = (data as { person?: Record<string, unknown> } | null)?.person
   if (!person) return { ok, email: null, verified: false }
 
@@ -204,13 +223,16 @@ async function tryApollo(
   }
 }
 
-async function tryContactOut(linkedinUrl: string): Promise<{ ok: boolean; emails: string[] }> {
+async function tryContactOut(
+  linkedinUrl: string,
+  timeoutMs: number
+): Promise<{ ok: boolean; emails: string[] }> {
   const { ok, data } = await callOrthogonal(
     'contactout',
     '/v1/people/linkedin',
     { profile: linkedinUrl },
     'GET',
-    SLOW_TIMEOUT_MS
+    timeoutMs
   )
   const p = (data as { profile?: { work_email?: string[]; email?: string[] } } | null)?.profile
   if (!p) return { ok, emails: [] }
@@ -223,14 +245,15 @@ async function tryContactOut(linkedinUrl: string): Promise<{ ok: boolean; emails
 // Bytemine: cheap-ish ($0.03) mid-tier. Returns a verified work email plus
 // profile data (no photo), so it can also backfill the card if Ocean/Apollo miss.
 async function tryBytemine(
-  linkedinUrl: string
+  linkedinUrl: string,
+  timeoutMs: number
 ): Promise<{ ok: boolean; emails: string[]; verified: boolean; profile?: Profile }> {
   const { ok, data } = await callOrthogonal(
     'bytemine',
     '/contacts/enrich',
     { linkedin: linkedinUrl },
     'POST',
-    MID_TIMEOUT_MS
+    timeoutMs
   )
   const d = data as Record<string, unknown> | null
   if (!d) return { ok, emails: [], verified: false }
@@ -269,6 +292,11 @@ export async function POST(request: NextRequest) {
 }
 
 async function handleLookup(request: NextRequest) {
+  // Wall-clock start. Provider timeouts are budgeted against this so the bot
+  // check + DB work already spent counts against the 10s function limit.
+  const t0 = Date.now()
+  const timeLeft = () => PROVIDER_BUDGET_MS - (Date.now() - t0)
+
   const body = await request.json().catch(() => null)
   if (!body) return NextResponse.json({ error: 'bad_request' }, { status: 400 })
 
@@ -371,10 +399,11 @@ async function handleLookup(request: NextRequest) {
   //    wins; Apollo and Ocean also supply the profile card (Ocean takes the
   //    bare handle, the others the full URL).
   const handle = cleanUrl.split('/in/')[1]
+  const t1 = Math.min(TIER1_TIMEOUT_MS, timeLeft())
   const [oceanR, aviatoR, apolloR] = await Promise.all([
-    tryOcean(handle),
-    tryAviato(cleanUrl),
-    tryApollo(cleanUrl),
+    tryOcean(handle, t1),
+    tryAviato(cleanUrl, t1),
+    tryApollo(cleanUrl, t1),
   ])
 
   let spent = 0
@@ -404,10 +433,11 @@ async function handleLookup(request: NextRequest) {
   const verifiedEmails = new Set<string>()
   if (apolloR.verified && apolloR.email) verifiedEmails.add(apolloR.email)
 
-  // 6. Tier 2 — Bytemine ($0.03), only if the cheap tier found nothing.
+  // 6. Tier 2 — Bytemine ($0.03), only if the cheap tier found nothing and we
+  //    still have meaningful time left in the budget.
   let bytemineOk = false
-  if (emails.length === 0) {
-    const bm = await tryBytemine(cleanUrl)
+  if (emails.length === 0 && timeLeft() > MIN_CALL_MS) {
+    const bm = await tryBytemine(cleanUrl, Math.min(TIER2_TIMEOUT_MS, timeLeft()))
     bytemineOk = bm.ok
     if (bm.ok) {
       spent += COST.bytemine
@@ -418,10 +448,10 @@ async function handleLookup(request: NextRequest) {
     profile = mergeProfiles(profile, bm.profile)
   }
 
-  // 7. Tier 3 — ContactOut ($0.33), last resort.
+  // 7. Tier 3 — ContactOut ($0.33), last resort — only if time remains.
   let contactOutOk = false
-  if (emails.length === 0) {
-    const co = await tryContactOut(cleanUrl)
+  if (emails.length === 0 && timeLeft() > MIN_CALL_MS) {
+    const co = await tryContactOut(cleanUrl, Math.min(TIER3_TIMEOUT_MS, timeLeft()))
     contactOutOk = co.ok
     if (co.ok) {
       spent += COST.contactout
