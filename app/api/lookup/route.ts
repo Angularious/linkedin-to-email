@@ -5,7 +5,13 @@ import { hashIdentity } from '@/lib/hash'
 import { verifyVisitorCookie } from '@/lib/identity'
 
 const ORTHOGONAL_URL = 'https://api.orthogonal.com/v1/run'
-const RATE_LIMIT = 3
+const RATE_LIMIT = 3 // per-visitor (signed cookie) lookups / 24h
+// Hard ceiling per source IP / 24h, enforced in addition to RATE_LIMIT and
+// independent of the cookie — so one attacker can't escape the limit by minting
+// fresh cookies. Generous enough not to pinch big shared NATs (campus/office);
+// the global spend cap is the real money guard, this just bounds single-source
+// abuse. Tune down if you see IP-level hammering.
+const IP_RATE_LIMIT = 30
 const WINDOW_HOURS = 24
 
 // Vercel Hobby kills a function at 10s. The slow path runs three provider phases
@@ -21,13 +27,18 @@ export const maxDuration = 10
 
 // Hard global ceiling on credits the demo can spend in a rolling 24h, in cents.
 // A backstop independent of the per-user limit: even if that's bypassed, total
-// spend can't exceed this. Default $25/day; override with DAILY_BUDGET_CENTS.
-const DAILY_BUDGET_CENTS = Number(process.env.DAILY_BUDGET_CENTS ?? 2500)
+// spend can't exceed this. Default $30/day; override with DAILY_BUDGET_CENTS.
+const DAILY_BUDGET_CENTS = Number(process.env.DAILY_BUDGET_CENTS ?? 3000)
 
 // Per-provider cost in cents (Orthogonal charges on a successful HTTP call,
 // regardless of whether an email was found). Ocean bills ~$0.0045 in practice;
-// rounded up to 1¢ so the budget cap errs high.
+// rounded up to 1¢ so the budget cap errs high. ContactOut is $0.33 without
+// phone (verified against the marketplace pricing formula).
 const COST = { ocean: 1, apollo: 1, aviato: 1, bytemine: 3, contactout: 33 }
+
+// Worst case if every tier runs. Reserved against the budget up front so
+// concurrent bursts can't collectively overshoot the cap.
+const MAX_COST_CENTS = Object.values(COST).reduce((a, b) => a + b, 0)
 
 // Normalize any LinkedIn URL variant to https://www.linkedin.com/in/slug
 function cleanLinkedInUrl(input: string): string | null {
@@ -262,10 +273,10 @@ async function handleLookup(request: NextRequest) {
   if (!body) return NextResponse.json({ error: 'bad_request' }, { status: 400 })
 
   const { url } = body as { url?: string }
-  const ip =
-    request.headers.get('x-forwarded-for')?.split(',')[0].trim() ??
-    request.headers.get('x-real-ip') ??
-    'unknown'
+  // Trust only platform-set values. The first X-Forwarded-For hop is
+  // client-supplied and trivially spoofable, so never key the rate limit on it;
+  // Vercel populates request.ip / x-real-ip from the real connection.
+  const ip = request.ip ?? request.headers.get('x-real-ip') ?? 'unknown'
 
   // 0. Reject cross-origin POSTs. Our UI always sends a same-origin request
   //    (Origin host === Host); a present, mismatched Origin is a direct/CSRF-
@@ -302,36 +313,58 @@ async function handleLookup(request: NextRequest) {
 
   const supabase = createServiceClient()
 
-  // 3. Global budget check BEFORE consuming the user's quota, so a user who
-  //    hits the cap doesn't also burn one of their free lookups.
-  const { data: spentCents, error: spendErr } = await supabase.rpc('recent_spend_cents', {
-    p_window_hours: WINDOW_HOURS,
-  })
-  if (spendErr) {
-    console.error('[lookup] spend check failed:', spendErr.message)
-    return NextResponse.json({ error: 'server' }, { status: 500 }) // fail closed
-  }
-  if ((spentCents ?? 0) >= DAILY_BUDGET_CENTS) {
-    return NextResponse.json({ at_capacity: true }, { status: 503 })
+  // Atomic rate-limit check (advisory-locked count + insert). Returns the
+  // post-insert count, or -1 if already at/over the limit.
+  async function checkLimit(identity: string, limit: number) {
+    const { data, error } = await supabase.rpc('check_and_log_attempt', {
+      p_identity: identity,
+      p_limit: limit,
+      p_window_hours: WINDOW_HOURS,
+    })
+    if (error) {
+      console.error('[lookup] rate-limit check failed:', error.message)
+      return 'error' as const
+    }
+    return data === -1 ? ('limited' as const) : ('ok' as const)
   }
 
-  // 4. Atomic per-user rate limit (advisory-locked count + insert).
-  //    Key on the signed visitor cookie when present (so distinct people on a
-  //    shared IP each get their own quota), falling back to IP for cookieless
-  //    clients (e.g. scripts hitting the API directly).
+  // 3. Rate limit. A signed httpOnly cookie identifies the visitor so distinct
+  //    people behind one NAT don't block each other. But because anyone can mint
+  //    a fresh cookie, we ALSO enforce a per-IP ceiling that cookie rotation
+  //    can't escape — both buckets must have room. Cookieless clients collapse
+  //    to a single, stricter IP bucket.
   const visitorId = await verifyVisitorCookie(request.cookies.get('lid')?.value)
-  const identity = await hashIdentity(visitorId ? `v:${visitorId}` : `ip:${ip}`)
-  const { data: attemptCount, error: rlErr } = await supabase.rpc('check_and_log_attempt', {
-    p_identity: identity,
-    p_limit: RATE_LIMIT,
+  const ipIdentity = await hashIdentity(`ip:${ip}`)
+
+  if (visitorId) {
+    const ipResult = await checkLimit(ipIdentity, IP_RATE_LIMIT)
+    if (ipResult === 'error') return NextResponse.json({ error: 'server' }, { status: 500 })
+    if (ipResult === 'limited') return NextResponse.json({ rate_limited: true }, { status: 429 })
+
+    const userResult = await checkLimit(await hashIdentity(`v:${visitorId}`), RATE_LIMIT)
+    if (userResult === 'error') return NextResponse.json({ error: 'server' }, { status: 500 })
+    if (userResult === 'limited') return NextResponse.json({ rate_limited: true }, { status: 429 })
+  } else {
+    const result = await checkLimit(ipIdentity, RATE_LIMIT)
+    if (result === 'error') return NextResponse.json({ error: 'server' }, { status: 500 })
+    if (result === 'limited') return NextResponse.json({ rate_limited: true }, { status: 429 })
+  }
+
+  // 4. Reserve budget headroom atomically BEFORE spending. Each in-flight lookup
+  //    books its worst-case cost under a lock, so a burst of concurrent requests
+  //    can't all read the same pre-spend total and collectively blow the cap.
+  //    The reservation is reconciled to the real amount once providers return.
+  const { data: reservationId, error: resErr } = await supabase.rpc('reserve_spend', {
     p_window_hours: WINDOW_HOURS,
+    p_budget_cents: DAILY_BUDGET_CENTS,
+    p_reserve_cents: MAX_COST_CENTS,
   })
-  if (rlErr) {
-    console.error('[lookup] rate-limit check failed:', rlErr.message)
+  if (resErr) {
+    console.error('[lookup] budget reservation failed:', resErr.message)
     return NextResponse.json({ error: 'server' }, { status: 500 }) // fail closed
   }
-  if (attemptCount === -1) {
-    return NextResponse.json({ rate_limited: true }, { status: 429 })
+  if (!reservationId) {
+    return NextResponse.json({ at_capacity: true }, { status: 503 })
   }
 
   // 5. Tier 1 — three cheap providers in parallel ($0.01 each). First email
@@ -397,13 +430,15 @@ async function handleLookup(request: NextRequest) {
     if (co.emails.length > 0) emails = co.emails
   }
 
-  // 8. Record spend (best-effort; the global cap is the real guard)
-  if (spent > 0) {
-    const { error } = await supabase
-      .from('spend_log')
-      .insert({ cost_cents: spent, providers: providers.join('+') })
-    if (error) console.error('[lookup] spend_log insert failed:', error.message)
-  }
+  // 8. Reconcile the up-front reservation to what we actually spent (0 if every
+  //    provider failed). Best-effort — a stale reservation just ages out of the
+  //    24h window, erring on the safe side of the budget.
+  const { error: reconErr } = await supabase.rpc('reconcile_spend', {
+    p_id: reservationId,
+    p_cost_cents: spent,
+    p_providers: providers.join('+') || 'none',
+  })
+  if (reconErr) console.error('[lookup] spend reconcile failed:', reconErr.message)
 
   if (emails.length > 0) {
     // The badge applies to the primary (displayed) email only.
