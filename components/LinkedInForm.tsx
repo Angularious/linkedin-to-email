@@ -258,7 +258,15 @@ export default function LinkedInForm() {
             </form>
 
             <p style={{ fontSize: '16px', color: '#aaa', textAlign: 'center' }}>
-              3 free lookups per day &nbsp;·&nbsp; no sign-up needed
+              3 free lookups per day &nbsp;·&nbsp;{' '}
+              <a
+                href={ORTHOGONAL_CTA}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ color: '#888', textDecoration: 'underline', textDecorationStyle: 'wavy' }}
+              >
+                sign-up to build your own
+              </a>
             </p>
           </div>
         </div>
