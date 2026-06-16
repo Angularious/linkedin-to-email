@@ -27,6 +27,16 @@ interface Profile {
 
 const ORTHOGONAL_CTA = 'https://orthogonal.com?utm_source=linkedin-email-demo&utm_medium=referral'
 
+// Merge profile fields across phases, first non-empty value wins.
+function mergeProfiles(a: Profile, b?: Profile): Profile {
+  if (!b) return a
+  const merged: Profile = { ...a }
+  for (const k of Object.keys(b) as (keyof Profile)[]) {
+    if (merged[k] === undefined && b[k] !== undefined) merged[k] = b[k]
+  }
+  return merged
+}
+
 export default function LinkedInForm() {
   const [url, setUrl] = useState('')
   const [uiState, setUiState] = useState<UIState>('idle')
@@ -46,7 +56,6 @@ export default function LinkedInForm() {
   const btnCanvasRef = useRef<HTMLCanvasElement>(null)
   const resultRef = useRef<HTMLDivElement>(null)
   const resultCanvasRef = useRef<HTMLCanvasElement>(null)
-  const slowTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const drawAll = useCallback(async () => {
     const rough = (await import('roughjs')).default
@@ -117,38 +126,57 @@ export default function LinkedInForm() {
     setUiState('loading')
     setShowDropdown(false)
     setLoadingMsg('looking...')
-    // The deep (ContactOut) path is the slow one — reassure rather than look stuck.
-    slowTimer.current = setTimeout(() => setLoadingMsg('checking deeper sources...'), 2500)
+
+    // The lookup runs as up to 3 sequential calls — Tier 1, then Bytemine, then
+    // ContactOut — each only fired if the previous misses. Each is its own
+    // request (its own 10s budget), carrying the single-use token the prior
+    // phase issued. We accumulate profile data across phases.
+    const PHASE_MSG: Record<number, string> = {
+      2: 'checking deeper sources...',
+      3: 'searching premium sources...',
+    }
+    let phase = 1
+    let token: string | undefined
+    let acc: Profile = {}
 
     try {
-      const res = await fetch('/api/lookup', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url.trim() }),
-      })
-      const data = await res.json()
+      // Bounded loop (max 3 phases) — `continue` advances; anything else is terminal.
+      for (let i = 0; i < 4; i++) {
+        if (PHASE_MSG[phase]) setLoadingMsg(PHASE_MSG[phase])
+        const res = await fetch('/api/lookup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: url.trim(), phase, token }),
+        })
+        const data = await res.json()
 
-      if (data.emails?.length > 0) {
-        setEmails(data.emails)
-        setVerified(!!data.verified)
-        setProfile(data.profile ?? null)
-        setUiState('success')
-      } else if (data.rate_limited) {
-        setUiState('rate_limited')
-      } else if (data.at_capacity) {
-        setUiState('at_capacity')
-      } else if (data.not_found) {
-        setUiState('not_found')
-        setShowModal(true)
-      } else if (data.invalid) {
-        setUiState('invalid_url')
-      } else {
-        setUiState('error')
+        if (data.profile) acc = mergeProfiles(acc, data.profile)
+
+        if (data.emails?.length > 0) {
+          setEmails(data.emails)
+          setVerified(!!data.verified)
+          setProfile(Object.keys(acc).length ? acc : null)
+          setUiState('success')
+          return
+        }
+        if (data.continue && data.phase) {
+          phase = data.phase
+          token = data.token
+          continue
+        }
+        // Terminal, non-success outcomes.
+        if (data.rate_limited) setUiState('rate_limited')
+        else if (data.at_capacity) setUiState('at_capacity')
+        else if (data.not_found) {
+          setUiState('not_found')
+          setShowModal(true)
+        } else if (data.invalid) setUiState('invalid_url')
+        else setUiState('error')
+        return
       }
+      setUiState('error')
     } catch {
       setUiState('error')
-    } finally {
-      if (slowTimer.current) clearTimeout(slowTimer.current)
     }
   }
 

@@ -44,6 +44,37 @@ export async function signVisitorId(id: string): Promise<string> {
   return `${id}.${await hmacHex(id)}`
 }
 
+// ── Continuation token for the phased lookup ──
+// Binds a single-use nonce to the cleaned URL with a short expiry, signed with
+// the same secret as visitor cookies. Phases 2/3 of a lookup present this instead
+// of re-running the bot check / rate limit; the nonce is redeemed server-side
+// (see consume_nonce) so the token can't be replayed to repeat paid calls.
+const LOOKUP_TOKEN_TTL_MS = 60_000
+
+export async function signLookupToken(cleanUrl: string): Promise<{ token: string; nonce: string }> {
+  const nonce = crypto.randomUUID()
+  const expiry = Date.now() + LOOKUP_TOKEN_TTL_MS
+  const sig = await hmacHex(`${nonce}|${expiry}|${cleanUrl}`)
+  return { token: `${nonce}.${expiry}.${sig}`, nonce }
+}
+
+export async function verifyLookupToken(
+  token: string | undefined,
+  cleanUrl: string
+): Promise<{ valid: boolean; nonce: string | null }> {
+  if (!token) return { valid: false, nonce: null }
+  const parts = token.split('.')
+  if (parts.length !== 3) return { valid: false, nonce: null }
+  const [nonce, expiryStr, sig] = parts
+  const expiry = Number(expiryStr)
+  if (!Number.isFinite(expiry) || expiry < Date.now()) return { valid: false, nonce: null }
+  const expected = await hmacHex(`${nonce}|${expiry}|${cleanUrl}`)
+  if (sig.length !== expected.length) return { valid: false, nonce: null }
+  let diff = 0
+  for (let i = 0; i < sig.length; i++) diff |= sig.charCodeAt(i) ^ expected.charCodeAt(i)
+  return diff === 0 ? { valid: true, nonce } : { valid: false, nonce: null }
+}
+
 // Returns the visitor id if the cookie's signature is valid, else null.
 export async function verifyVisitorCookie(cookieValue: string | undefined): Promise<string | null> {
   if (!cookieValue) return null
