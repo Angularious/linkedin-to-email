@@ -62,13 +62,20 @@ natural "sign up to unlock" hook for the orthogonal.com CTAs.
   at **phase 1**. `withBotId` in next.config, `<BotIdClient>` in the layout,
   `checkBotId()` in the route (before any DB/paid work; 403 if flagged). No-ops in
   local dev. Upgrade path: deepAnalysis check level (requires Pro).
-- **Rate limit — two buckets, both must have room — consumed once per lookup at
-  phase 1.** Identity = signed httpOnly cookie (`middleware.ts`) so distinct
-  people on a shared IP each get a quota (`RATE_LIMIT`, 3/24h). Because anyone can
-  mint a fresh cookie, a per-IP ceiling (`IP_RATE_LIMIT`, 30/24h) is enforced in
-  parallel and can't be escaped by cookie rotation; cookieless clients collapse to
-  a single strict IP bucket. IP comes from `request.ip` / `x-real-ip` only — NOT
-  the spoofable first `X-Forwarded-For` hop. Atomic via `check_and_log_attempt`.
+- **Rate limit — checked at phase 1.** Two buckets:
+  - **Per-visitor quota** (`RATE_LIMIT`, 3/24h), keyed on the signed httpOnly
+    cookie (`middleware.ts`) so distinct people on a shared IP each get their own.
+    Counts **only successful lookups** — a "not found" never burns a free search.
+    The success row is written in `attempts` (key `v:<id>`) only when an email is
+    actually returned (in whichever phase finds it); the phase-1 check is a
+    read-only count of prior successes.
+  - **Per-IP ceiling** (`IP_RATE_LIMIT`, 30/24h, atomic `check_and_log_attempt`)
+    counts **every** attempt incl. misses. This is the cost backstop and the real
+    abuse bound — it's what makes "misses don't count" safe, since a flood of
+    not-found lookups still spends money. Cookie rotation can't escape it.
+    Cookieless clients have no per-visitor quota → a single strict IP bucket at
+    `RATE_LIMIT` (every attempt counts). IP comes from `request.ip` / `x-real-ip`
+    only — NOT the spoofable first `X-Forwarded-For` hop.
 - **Phased continuation tokens.** Since phases 2/3 skip the bot/rate-limit gate,
   phase 1 issues a **single-use, URL-bound, short-lived** token (`signLookupToken`,
   HMAC over `nonce|expiry|url`); phases 2/3 verify it and redeem the nonce via

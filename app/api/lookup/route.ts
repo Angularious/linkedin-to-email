@@ -340,10 +340,15 @@ async function handleLookup(request: NextRequest) {
 
   const supabase = createServiceClient()
 
-  // 2. Gate. Phase 1 is the only entry point: it runs the bot check + rate limit
-  //    and consumes the visitor's quota. Phases 2/3 are continuations that
-  //    present the single-use token phase 1 issued — we redeem its nonce here so
-  //    it can't be replayed to trigger repeat paid calls (esp. ContactOut).
+  // Visitor identity (signed httpOnly cookie), resolved in every phase so a
+  // successful lookup can be recorded against the per-visitor quota below.
+  const visitorId = await verifyVisitorCookie(request.cookies.get('lid')?.value)
+  const visitorIdentity = visitorId ? await hashIdentity(`v:${visitorId}`) : null
+
+  // 2. Gate. Phase 1 is the only entry point: it runs the bot check + rate limit.
+  //    Phases 2/3 are continuations that present the single-use token phase 1
+  //    issued — we redeem its nonce here so it can't be replayed to trigger
+  //    repeat paid calls (esp. ContactOut).
   if (phase === 1) {
     const bot = await checkBotId({ advancedOptions: { checkLevel: 'basic' } })
     if (bot.isBot) {
@@ -364,24 +369,33 @@ async function handleLookup(request: NextRequest) {
       return data === -1 ? ('limited' as const) : ('ok' as const)
     }
 
-    // A signed httpOnly cookie identifies the visitor so distinct people behind
-    // one NAT don't block each other. Because anyone can mint a fresh cookie, we
-    // ALSO enforce a per-IP ceiling that cookie rotation can't escape — both must
-    // have room. Cookieless clients collapse to a single, stricter IP bucket.
-    const visitorId = await verifyVisitorCookie(request.cookies.get('lid')?.value)
+    // Per-IP ceiling counts EVERY attempt (success or miss). This is the cost
+    // backstop and the real abuse bound — it's what keeps "misses don't count"
+    // safe, since a flood of not-found lookups still spends money. Cookieless
+    // clients have no per-visitor quota, so they collapse to a single strict IP
+    // bucket (every attempt counts).
     const ipIdentity = await hashIdentity(`ip:${ip}`)
-    if (visitorId) {
-      const ipResult = await checkLimit(ipIdentity, IP_RATE_LIMIT)
-      if (ipResult === 'error') return NextResponse.json({ error: 'server' }, { status: 500 })
-      if (ipResult === 'limited') return NextResponse.json({ rate_limited: true }, { status: 429 })
+    const ipResult = await checkLimit(ipIdentity, visitorIdentity ? IP_RATE_LIMIT : RATE_LIMIT)
+    if (ipResult === 'error') return NextResponse.json({ error: 'server' }, { status: 500 })
+    if (ipResult === 'limited') return NextResponse.json({ rate_limited: true }, { status: 429 })
 
-      const userResult = await checkLimit(await hashIdentity(`v:${visitorId}`), RATE_LIMIT)
-      if (userResult === 'error') return NextResponse.json({ error: 'server' }, { status: 500 })
-      if (userResult === 'limited') return NextResponse.json({ rate_limited: true }, { status: 429 })
-    } else {
-      const result = await checkLimit(ipIdentity, RATE_LIMIT)
-      if (result === 'error') return NextResponse.json({ error: 'server' }, { status: 500 })
-      if (result === 'limited') return NextResponse.json({ rate_limited: true }, { status: 429 })
+    if (visitorIdentity) {
+      // Per-visitor quota counts only SUCCESSFUL lookups, so a "not found" never
+      // burns one of the visitor's free searches. Read-only here — the success
+      // row is written once an email is actually returned (step 6).
+      const since = new Date(Date.now() - WINDOW_HOURS * 3600_000).toISOString()
+      const { count, error } = await supabase
+        .from('attempts')
+        .select('id', { count: 'exact', head: true })
+        .eq('user_hash', visitorIdentity)
+        .gte('created_at', since)
+      if (error) {
+        console.error('[lookup] success-count check failed:', error.message)
+        return NextResponse.json({ error: 'server' }, { status: 500 })
+      }
+      if ((count ?? 0) >= RATE_LIMIT) {
+        return NextResponse.json({ rate_limited: true }, { status: 429 })
+      }
     }
   } else {
     const tok = await verifyLookupToken(token, cleanUrl)
@@ -492,6 +506,12 @@ async function handleLookup(request: NextRequest) {
 
   // 6. Respond.
   if (emails.length > 0) {
+    // Only a successful lookup counts toward the per-visitor quota (3/day) —
+    // recorded here, in whichever phase actually found the email. Best-effort.
+    if (visitorIdentity) {
+      const { error } = await supabase.from('attempts').insert({ user_hash: visitorIdentity })
+      if (error) console.error('[lookup] success log failed:', error.message)
+    }
     return NextResponse.json({ emails, profile, verified })
   }
   if (phase < 3) {
