@@ -12,15 +12,16 @@ so abuse/cost protection matters.
 - Hand-drawn UI via rough.js + Indie Flower font (inline styles)
 
 ## Lookup pipeline (`app/api/lookup/route.ts` — phased)
-The lookup is **3 separate HTTP calls** (`{ url, phase, token }`), the client
-(`LinkedInForm`) driving each only on a miss. Each phase is its own serverless
+The lookup is **2 separate HTTP calls** (`{ url, phase, token }`), the client
+(`LinkedInForm`) driving phase 2 only on a miss. Each phase is its own serverless
 invocation with its own 10s Vercel limit, so a slow provider doesn't have to
 share one 10s window — that cramming was aborting live calls. Per phase:
 - **Phase 1** — clean/validate URL → bot check + rate limit (the only quota
-  consumer) → reserve budget → **Ocean.io ∥ Aviato ∥ Apollo** ($0.01 each, ~8s
-  each). Apollo/Ocean also return the profile card. Hit → done.
-- **Phase 2** — verify single-use token → reserve → **Bytemine** ($0.03).
-- **Phase 3** — verify single-use token → reserve → **ContactOut** ($0.33).
+  consumer) → reserve budget → **Ocean.io ∥ Aviato ∥ Apollo ∥ Bytemine** in
+  parallel (~$0.06, ~8s). Apollo/Ocean/Bytemine also return the profile card.
+  Bytemine runs here (not as a fallback) to raise hit quality cheaply. Hit → done.
+- **Phase 2** — verify single-use token → reserve → **ContactOut** ($0.33),
+  the expensive last resort, only when phase 1 finds nothing.
 
 On a miss, a phase returns `{ continue, phase, token, profile }`; the client
 redeems `token` on the next call and accumulates `profile` across phases. A hit
