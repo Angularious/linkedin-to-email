@@ -407,9 +407,9 @@ export default function LinkedInForm() {
                 <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
                   <Image src="/x.svg" width={28} height={28} alt="not found" style={{ flexShrink: 0 }} />
                   <span style={{ flex: 1 }}>
-                    well, this one&apos;s a ghost. 👻
+                    well, this one&apos;s a ghost.
                     <span style={{ display: 'block', fontSize: '14px', color: '#999', marginTop: '3px' }}>
-                      we pinged all 5 of our data providers and still came up empty —{' '}
+                      we pinged 5 providers and still came up empty —{' '}
                       <a href={ORTHOGONAL_CTA} target="_blank" rel="noopener noreferrer"
                         style={{ color: '#c0392b', textDecoration: 'underline', textDecorationStyle: 'wavy', textUnderlineOffset: '3px' }}>
                         sign up to dig deeper.
@@ -479,10 +479,10 @@ export default function LinkedInForm() {
             <ModalBorder />
             <div style={{ position: 'relative', zIndex: 1 }}>
               <p style={{ fontSize: '22px', color: '#111', lineHeight: 1.4, marginBottom: '8px' }}>
-                well, this one&apos;s a ghost. 👻
+                well, this one&apos;s a ghost.
               </p>
               <p style={{ fontSize: '16px', color: '#999', lineHeight: 1.4, marginBottom: '24px' }}>
-                we pinged all 5 of our data providers and still came up empty. sign up to run deeper
+                we pinged 5 providers and still came up empty. sign up to run deeper
                 searches of your own.
               </p>
               <a
