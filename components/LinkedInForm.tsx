@@ -231,7 +231,12 @@ export default function LinkedInForm() {
                   disabled={isLoading}
                   style={{
                     width: '100%', padding: '13px 14px', fontFamily: 'inherit',
-                    fontSize: '22px', fontWeight: 400, border: 'none',
+                    // Loading copy ("checking deeper sources...") is longer than the
+                    // CTA; shrink it and keep it on one line so it always fits the
+                    // hand-drawn box, which is only redrawn on uiState change (not
+                    // when the loading message updates mid-lookup).
+                    fontSize: isLoading ? '17px' : '22px', fontWeight: 400, border: 'none',
+                    whiteSpace: 'nowrap',
                     background: 'transparent', color: '#111',
                     cursor: isLoading ? 'default' : 'pointer',
                     position: 'relative', zIndex: 1, letterSpacing: '1px',
