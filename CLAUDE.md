@@ -8,7 +8,7 @@ so abuse/cost protection matters.
 - Next.js 14 (App Router), deployed on Vercel
 - Supabase (Postgres) for rate limiting + spend tracking
 - Orthogonal REST API (`https://api.orthogonal.com/v1/run`) for the lookups.
-  Providers: Ocean.io, Aviato, Apollo (cheap tier), Bytemine, ContactOut.
+  Providers: Ocean.io, Aviato, Apollo, Bytemine (phase 1, parallel), ContactOut (phase 2).
 - Hand-drawn UI via rough.js + Indie Flower font (inline styles)
 
 ## Lookup pipeline (`app/api/lookup/route.ts` — phased)
@@ -33,9 +33,10 @@ failure and not billable. `callOrthogonal` flags it as `notFound`, so it counts
 as "responded" (→ `not_found`, never a 502) but is charged $0. Only true errors
 (timeout / 5xx / network) leave a phase with no responder and yield `error`/502.
 
-Worst-case cost ~$0.36, but expected cost is low: three $0.01 sources resolve most
-profiles before Bytemine/ContactOut are paid for. Full-miss wall-clock is up to
-~3×10s, surfaced via "checking deeper / premium sources…" messaging.
+Worst-case cost ~$0.39 (phase 1 ~$0.06 + ContactOut $0.33); expected cost ~$0.06,
+since the four parallel phase-1 providers resolve most profiles before ContactOut
+is ever paid for. Full-miss wall-clock is up to ~2×10s, surfaced via a "checking
+deeper sources…" message.
 
 Provider response shapes are unwrapped from Orthogonal's `{ data: ... }` envelope.
 GET endpoints (Aviato, ContactOut) pass params as `query`; POST (Ocean, Apollo,
@@ -46,8 +47,8 @@ Ocean `people[0].email(.address)`, Bytemine flat `work_email`/`email`.
 The response also returns `profile` (merged field-by-field across providers via
 `mergeProfiles` — Apollo photo, Ocean company card, etc.) and a `verified` flag.
 `verified` is true only when the *displayed* email (`emails[0]`) carries a real
-deliverability signal — Apollo `email_status === 'verified'` (common path) or
-Bytemine `email_finder.smtp_result === 'valid'`/`confidence === 'high'` (fallback).
+deliverability signal — Apollo `email_status === 'verified'` or Bytemine
+`email_finder.smtp_result === 'valid'`/`confidence === 'high'` (both run in phase 1).
 The UI shows a "✓ verified" badge on the primary email plus location and a
 company line (logo · industry · size) in the "more info" dropdown.
 
@@ -77,23 +78,25 @@ natural "sign up to unlock" hook for the orthogonal.com CTAs.
     Cookieless clients have no per-visitor quota → a single strict IP bucket at
     `RATE_LIMIT` (every attempt counts). IP comes from `request.ip` / `x-real-ip`
     only — NOT the spoofable first `X-Forwarded-For` hop.
-- **Phased continuation tokens.** Since phases 2/3 skip the bot/rate-limit gate,
+- **Phased continuation token.** Since phase 2 skips the bot/rate-limit gate,
   phase 1 issues a **single-use, URL-bound, short-lived** token (`signLookupToken`,
-  HMAC over `nonce|expiry|url`); phases 2/3 verify it and redeem the nonce via
+  HMAC over `nonce|expiry|url`); phase 2 verifies it and redeems the nonce via
   `consume_nonce` (unique-insert → false on replay). So one rate-limited phase-1
-  yields at most one Bytemine + one ContactOut call — a token can't be replayed to
-  hammer the paid tiers, and 2/3 can't be called directly without a valid token.
+  yields at most one ContactOut call — the token can't be replayed to hammer the
+  $0.33 tier, and phase 2 can't be called directly without a valid token.
 - **Global spend cap — concurrency-safe, per phase.** Each phase calls
   `reserve_spend` (books its tier's worst-case cost under an advisory lock *before*
   the provider call) then `reconcile_spend` (corrects to the real amount). Closes
   the TOCTOU race where bursting requests overshoot the cap. `DAILY_BUDGET_CENTS`
-  default $30/24h — the real money backstop.
+  defaults to $30/24h in code; **prod is set to $35** via the Vercel env var — the
+  real money backstop.
 - Rate-limit and budget checks **fail closed** on any Supabase error.
 
 ## Env vars
 Required: `ORTHOGONAL_API_KEY`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`
-Optional: `DAILY_BUDGET_CENTS` (default 3000 = $30), `IDENTITY_SECRET` (falls back
-to the service role key), `NEXT_PUBLIC_SITE_URL` (OG/social previews)
+Optional: `DAILY_BUDGET_CENTS` (code default 3000 = $30; **prod set to 3500 = $35**),
+`IDENTITY_SECRET` (falls back to the service role key), `NEXT_PUBLIC_SITE_URL`
+(OG/social previews)
 NOTE: if `DAILY_BUDGET_CENTS` is set in the Vercel dashboard it overrides the code
 default — update it there to change the cap in prod.
 
@@ -106,14 +109,25 @@ fails closed. `lookup_nonces` grows one row per phase-2/3 call — prune old row
 
 ## Status
 Live at `getemailfromlinkedin.vercel.app`. Cloudflare Turnstile removed; Vercel
-BotID (basic) is the bot gate. Lookup is split into 3 phased calls so each tier
-gets a full 10s budget (fixed cold-start/slow-provider aborts). Spend cap is
-reservation-based (concurrency-safe, $30/day); rate limiting enforces a
-cookie-proof per-IP ceiling on a trusted IP, consumed once per lookup with
-single-use tokens guarding the continuation phases.
+BotID (basic) is the bot gate. Lookup is split into 2 phased calls (phase 1: four
+providers in parallel; phase 2: ContactOut) so each gets a full 10s budget (fixed
+the cold-start/slow-provider aborts). Spend cap is reservation-based
+(concurrency-safe, $35/day in prod). Per-visitor quota is 5 *successful*
+lookups/day, with a cookie-proof per-IP ceiling on a trusted IP and single-use
+tokens guarding the ContactOut phase.
 
-## Possible future hardening (not urgent)
-- **Vercel WAF rate-limit rule** on `/api/lookup` — edge throttling by IP before
-  the function runs. Dashboard-only, but requires the Pro plan.
-- **BotID deepAnalysis** check level — stronger detection, requires Pro.
-- **Attack Challenge Mode** — emergency toggle (Firewall tab) if actively hammered.
+## Possible future hardening
+- **Move off Vercel Hobby → Pro (top item before scaling).** Hobby is
+  non-commercial-use only; this lead-gen demo is a ToS violation that risks
+  suspension. Won't bite at ~100 users, but fix it before a bigger push. Pro also
+  unlocks WAF rate-limiting and 300s functions.
+- **Guard `DAILY_BUDGET_CENTS`** — a non-numeric env value makes `Number()` → NaN,
+  which silently disables the cap. Validate it's a positive finite number.
+- **Pin the Vercel function region** near the Supabase region (no `vercel.json`
+  today) so the ~4–6 DB round-trips/lookup don't pay cross-region latency.
+- **Keep-warm cron** — Supabase free pauses after 7 days idle; a periodic ping
+  avoids a cold "site is down" on the next visit.
+- **TTL-cleanup** `attempts` / `spend_log` / `lookup_nonces` for a long-lived demo
+  (they grow one row per attempt/lookup; affects the 500 MB cap and query speed).
+- **Vercel WAF rate-limit rule / BotID deepAnalysis / Attack Challenge Mode** —
+  all Pro-tier edge protections.
