@@ -64,7 +64,7 @@ natural "sign up to unlock" hook for the orthogonal.com CTAs.
   `checkBotId()` in the route (before any DB/paid work; 403 if flagged). No-ops in
   local dev. Upgrade path: deepAnalysis check level (requires Pro).
 - **Rate limit — checked at phase 1.** Two buckets:
-  - **Per-visitor quota** (`RATE_LIMIT`, 3/24h), keyed on the signed httpOnly
+  - **Per-visitor quota** (`RATE_LIMIT`, 5/24h), keyed on the signed httpOnly
     cookie (`middleware.ts`) so distinct people on a shared IP each get their own.
     Counts **only successful lookups** — a "not found" never burns a free search.
     The success row is written in `attempts` (key `v:<id>`) only when an email is

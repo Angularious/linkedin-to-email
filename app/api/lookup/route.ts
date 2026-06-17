@@ -5,7 +5,7 @@ import { hashIdentity } from '@/lib/hash'
 import { verifyVisitorCookie, signLookupToken, verifyLookupToken } from '@/lib/identity'
 
 const ORTHOGONAL_URL = 'https://api.orthogonal.com/v1/run'
-const RATE_LIMIT = 3 // per-visitor (signed cookie) lookups / 24h
+const RATE_LIMIT = 5 // per-visitor (signed cookie) successful lookups / 24h
 // Hard ceiling per source IP / 24h, enforced in addition to RATE_LIMIT and
 // independent of the cookie — so one attacker can't escape the limit by minting
 // fresh cookies. Generous enough not to pinch big shared NATs (campus/office);
