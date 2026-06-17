@@ -192,17 +192,30 @@ async function tryAviato(
 async function tryApollo(
   linkedinUrl: string,
   timeoutMs: number
-): Promise<{ ok: boolean; responded: boolean; email: string | null; verified: boolean; profile?: Profile }> {
+): Promise<{
+  ok: boolean
+  responded: boolean
+  email: string | null
+  personalEmails: string[]
+  verified: boolean
+  profile?: Profile
+}> {
   const { ok, notFound, data } = await callOrthogonal(
     'apollo',
     '/api/v1/people/match',
-    { linkedin_url: linkedinUrl, reveal_personal_emails: false },
+    { linkedin_url: linkedinUrl, reveal_personal_emails: true },
     'POST',
     timeoutMs
   )
   const responded = ok || notFound
   const person = (data as { person?: Record<string, unknown> } | null)?.person
-  if (!person) return { ok, responded, email: null, verified: false }
+  if (!person) return { ok, responded, email: null, personalEmails: [], verified: false }
+
+  // With reveal_personal_emails, Apollo returns personal addresses in a separate
+  // array (work email stays in `email`).
+  const personalEmails = Array.isArray(person.personal_emails)
+    ? (person.personal_emails as unknown[]).filter((e): e is string => typeof e === 'string')
+    : []
 
   const org = person.organization as { name?: string; logo_url?: string } | undefined
   const location =
@@ -223,6 +236,7 @@ async function tryApollo(
     ok,
     responded,
     email: (person.email as string) || null,
+    personalEmails,
     // Apollo tags each email: "verified" | "guessed" | "unavailable" | null.
     verified: (person.email_status as string) === 'verified',
     profile: profile.name || profile.title ? profile : undefined,
@@ -468,9 +482,14 @@ async function handleLookup(request: NextRequest) {
     // a 502.
     anyOk = oceanR.responded || aviatoR.responded || apolloR.responded
     profile = mergeProfiles(apolloR.profile, oceanR.profile)
-    // Aviato lists work emails first, so keep its order ahead of the singletons.
+    // Aviato lists work emails first; keep work addresses ahead of Apollo's
+    // personal ones.
     emails = Array.from(
-      new Set([...aviatoR.emails, oceanR.email, apolloR.email].filter(Boolean) as string[])
+      new Set(
+        [...aviatoR.emails, oceanR.email, apolloR.email, ...apolloR.personalEmails].filter(
+          Boolean
+        ) as string[]
+      )
     )
     // The badge applies only to the displayed email, and only Apollo vouches in
     // this phase.
