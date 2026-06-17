@@ -29,9 +29,12 @@ returns `{ emails, profile, verified }`; terminal states are `not_found` /
 `at_capacity` / `rate_limited` / `invalid` / `error`.
 
 A provider HTTP **404 = "no record for this profile"** — a clean miss, not a
-failure and not billable. `callOrthogonal` flags it as `notFound`, so it counts
-as "responded" (→ `not_found`, never a 502) but is charged $0. Only true errors
-(timeout / 5xx / network) leave a phase with no responder and yield `error`/502.
+failure and not billable. `callOrthogonal` returns it as `responded: true` (with
+`ok: false`), so it counts toward `not_found` (never a 502) but is charged $0.
+Only true errors (timeout / 5xx / network) leave a phase with no responder. A
+phase-1 miss where **no** provider responded is treated as an outage: the route
+returns 502 immediately rather than escalating to (and paying for) the ContactOut
+tier and then masking the failure as `not_found`.
 
 Worst-case cost ~$0.39 (phase 1 ~$0.06 + ContactOut $0.33); expected cost ~$0.06,
 since the four parallel phase-1 providers resolve most profiles before ContactOut
@@ -68,9 +71,12 @@ natural "sign up to unlock" hook for the orthogonal.com CTAs.
   - **Per-visitor quota** (`RATE_LIMIT`, 5/24h), keyed on the signed httpOnly
     cookie (`middleware.ts`) so distinct people on a shared IP each get their own.
     Counts **only successful lookups** — a "not found" never burns a free search.
-    The success row is written in `attempts` (key `v:<id>`) only when an email is
-    actually returned (in whichever phase finds it); the phase-1 check is a
-    read-only count of prior successes.
+    The phase-1 check is a cheap read-only count of prior successes (fast-fail);
+    the authoritative record (key `v:<id>`) is written on a hit, in whichever
+    phase finds the email, through the **same advisory-locked `check_and_log_attempt`
+    RPC** as the IP bucket — so concurrent wins from one cookie can't race past the
+    cap. A win that does race past returns `rate_limited` rather than an uncounted
+    free lookup.
   - **Per-IP ceiling** (`IP_RATE_LIMIT`, 30/24h, atomic `check_and_log_attempt`)
     counts **every** attempt incl. misses. This is the cost backstop and the real
     abuse bound — it's what makes "misses don't count" safe, since a flood of
@@ -104,8 +110,36 @@ default — update it there to change the cap in prod.
 Run the migrations in `supabase/migrations/` in order in the Supabase SQL editor:
 `0001_rate_limit_and_budget.sql`, `0002_budget_reservation.sql`, then
 `0003_lookup_nonces.sql`. Without 0002/0003 the RPCs are missing and every lookup
-fails closed. `lookup_nonces` grows one row per phase-2/3 call — prune old rows by
+fails closed. `lookup_nonces` grows one row per phase-2 call — prune old rows by
 `created_at` if it ever gets large.
+
+**Migrations are NOT auto-applied** — there's no migration runner; editing a file
+in `supabase/migrations/` does nothing to the live DB until you paste the changed
+statements into the SQL editor yourself. `create or replace function` swaps a
+function body in place with no data loss, so re-running a changed function is safe.
+All five functions pin `set search_path = public, pg_temp` (clears Supabase's
+"Function Search Path Mutable" advisory); they are `SECURITY INVOKER` (the default).
+
+## Shared Supabase project (multiple demos)
+This Supabase project (one Postgres database) is **shared by several Orthogonal
+demo sites, but each demo namespaces its own tables — there is no shared data.**
+This site owns exactly three tables — `attempts`, `spend_log`, `lookup_nonces` —
+plus its RPCs (`check_and_log_attempt`, `reserve_spend`, `reconcile_spend`,
+`recent_spend_cents`, `consume_nonce`). The other demos have their own
+differently-named tables (e.g. `job_dashboard_*`, `jobenrich_*`, and a
+`rate_events`/`spend_events`/`search_events` + `daily_spend`/`rate_limits` set).
+
+Implications:
+- **Budget and rate limits are per-site, NOT pooled.** `reserve_spend` sums only
+  `spend_log` and the rate RPCs touch only `attempts` — tables only this site
+  writes to. A busy sibling site can't consume this site's budget or IP quota.
+- **What IS shared is the physical project:** the free-tier 500 MB storage cap,
+  the connection pool, and the `public` table/function namespace. So:
+  - The 500 MB ceiling is collective — TTL-cleanup of `attempts`/`spend_log`/
+    `lookup_nonces` matters more with roommates (see future-hardening below).
+  - Table/function names must stay unique across demos. Ours are currently
+    unprefixed; a name+signature collision with another demo's function would
+    clobber it. A prefix (e.g. `l2e_`) would be safer if more demos are added.
 
 ## Status
 Live at `getemailfromlinkedin.vercel.app`. Cloudflare Turnstile removed; Vercel
