@@ -16,6 +16,7 @@ alter table lookup_nonces enable row level security;
 -- Atomically claim a nonce: true the first time, false on any replay.
 create or replace function consume_nonce(p_nonce uuid) returns boolean
 language plpgsql
+set search_path = public, pg_temp
 as $$
 begin
   insert into lookup_nonces (nonce) values (p_nonce);

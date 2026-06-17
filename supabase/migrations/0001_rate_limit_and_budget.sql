@@ -36,6 +36,7 @@ create or replace function check_and_log_attempt(
   p_window_hours int
 ) returns int
 language plpgsql
+set search_path = public, pg_temp
 as $$
 declare
   current_count int;
@@ -61,6 +62,7 @@ $$;
 create or replace function recent_spend_cents(p_window_hours int)
 returns int
 language sql
+set search_path = public, pg_temp
 as $$
   select coalesce(sum(cost_cents), 0)::int
   from spend_log

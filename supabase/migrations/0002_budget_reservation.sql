@@ -18,6 +18,7 @@ create or replace function reserve_spend(
   p_reserve_cents int
 ) returns uuid
 language plpgsql
+set search_path = public, pg_temp
 as $$
 declare
   spent int;
@@ -48,6 +49,7 @@ create or replace function reconcile_spend(
   p_providers text
 ) returns void
 language sql
+set search_path = public, pg_temp
 as $$
   update spend_log
   set cost_cents = p_cost_cents, providers = p_providers
