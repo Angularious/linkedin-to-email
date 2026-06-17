@@ -407,12 +407,14 @@ export default function LinkedInForm() {
                 <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
                   <Image src="/x.svg" width={28} height={28} alt="not found" style={{ flexShrink: 0 }} />
                   <span style={{ flex: 1 }}>
-                    this one is hard to find.{' '}
-                    <a href={ORTHOGONAL_CTA} target="_blank" rel="noopener noreferrer"
-                      style={{ color: '#c0392b', textDecoration: 'underline', textDecorationStyle: 'wavy', textUnderlineOffset: '3px' }}>
-                      sign up at orthogonal.com
-                    </a>{' '}
-                    to unlock more.
+                    well, this one&apos;s a ghost.
+                    <span style={{ display: 'block', fontSize: '14px', color: '#999', marginTop: '3px' }}>
+                      we searched 500M+ profiles and still came up empty —{' '}
+                      <a href={ORTHOGONAL_CTA} target="_blank" rel="noopener noreferrer"
+                        style={{ color: '#c0392b', textDecoration: 'underline', textDecorationStyle: 'wavy', textUnderlineOffset: '3px' }}>
+                        sign up to dig deeper.
+                      </a>
+                    </span>
                   </span>
                 </div>
               )}
@@ -476,9 +478,12 @@ export default function LinkedInForm() {
           >
             <ModalBorder />
             <div style={{ position: 'relative', zIndex: 1 }}>
-              <p style={{ fontSize: '22px', color: '#111', lineHeight: 1.4, marginBottom: '24px' }}>
-                this contact is hard to find.<br />
-                sign up at orthogonal.com to unlock more searches.
+              <p style={{ fontSize: '22px', color: '#111', lineHeight: 1.4, marginBottom: '8px' }}>
+                well, this one&apos;s a ghost.
+              </p>
+              <p style={{ fontSize: '16px', color: '#999', lineHeight: 1.4, marginBottom: '24px' }}>
+                we searched 500M+ profiles and still came up empty. sign up to run
+                deeper searches of your own.
               </p>
               <a
                 href={ORTHOGONAL_CTA} target="_blank" rel="noopener noreferrer"
