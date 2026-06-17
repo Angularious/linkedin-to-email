@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react'
 import Image from 'next/image'
+import { Profile, mergeProfiles } from '@/lib/profile'
 
 type UIState =
   | 'idle'
@@ -13,29 +14,7 @@ type UIState =
   | 'invalid_url'
   | 'error'
 
-interface Profile {
-  name?: string
-  title?: string
-  headline?: string
-  location?: string
-  company?: string
-  companyLogo?: string
-  companySize?: string
-  companyIndustry?: string
-  photoUrl?: string
-}
-
 const ORTHOGONAL_CTA = 'https://orthogonal.com?utm_source=linkedin-email-demo&utm_medium=referral'
-
-// Merge profile fields across phases, first non-empty value wins.
-function mergeProfiles(a: Profile, b?: Profile): Profile {
-  if (!b) return a
-  const merged: Profile = { ...a }
-  for (const k of Object.keys(b) as (keyof Profile)[]) {
-    if (merged[k] === undefined && b[k] !== undefined) merged[k] = b[k]
-  }
-  return merged
-}
 
 export default function LinkedInForm() {
   const [url, setUrl] = useState('')
@@ -127,21 +106,25 @@ export default function LinkedInForm() {
     setShowDropdown(false)
     setLoadingMsg('looking...')
 
-    // The lookup runs as up to 3 sequential calls — Tier 1, then Bytemine, then
-    // ContactOut — each only fired if the previous misses. Each is its own
-    // request (its own 10s budget), carrying the single-use token the prior
-    // phase issued. We accumulate profile data across phases.
+    // Phase 1 runs four providers in parallel and can take ~8s; nudge the copy at
+    // 2.5s so a slow-but-working lookup doesn't look stuck. Cleared once phase 1
+    // returns (advancing to phase 2 sets its own message below).
+    const slowTimer = setTimeout(() => setLoadingMsg('checking deeper sources...'), 2500)
+
+    // The lookup runs as up to 2 sequential calls — phase 1 (Ocean/Aviato/Apollo/
+    // Bytemine in parallel), then ContactOut, the second fired only if phase 1
+    // misses. Each is its own request (its own 10s budget), carrying the single-use
+    // token the prior phase issued. We accumulate profile data across phases.
     const PHASE_MSG: Record<number, string> = {
-      2: 'checking deeper sources...',
-      3: 'searching premium sources...',
+      2: 'searching premium sources...',
     }
     let phase = 1
     let token: string | undefined
     let acc: Profile = {}
 
     try {
-      // Bounded loop (max 3 phases) — `continue` advances; anything else is terminal.
-      for (let i = 0; i < 4; i++) {
+      // Bounded loop (max 2 phases) — `continue` advances; anything else is terminal.
+      for (let i = 0; i < 2; i++) {
         if (PHASE_MSG[phase]) setLoadingMsg(PHASE_MSG[phase])
         const res = await fetch('/api/lookup', {
           method: 'POST',
@@ -150,7 +133,7 @@ export default function LinkedInForm() {
         })
         const data = await res.json()
 
-        if (data.profile) acc = mergeProfiles(acc, data.profile)
+        if (data.profile) acc = mergeProfiles(acc, data.profile) ?? acc
 
         if (data.emails?.length > 0) {
           setEmails(data.emails)
@@ -160,6 +143,7 @@ export default function LinkedInForm() {
           return
         }
         if (data.continue && data.phase) {
+          clearTimeout(slowTimer)
           phase = data.phase
           token = data.token
           continue
@@ -177,6 +161,8 @@ export default function LinkedInForm() {
       setUiState('error')
     } catch {
       setUiState('error')
+    } finally {
+      clearTimeout(slowTimer)
     }
   }
 

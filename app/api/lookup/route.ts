@@ -3,6 +3,7 @@ import { checkBotId } from 'botid/server'
 import { createServiceClient } from '@/lib/supabase'
 import { hashIdentity } from '@/lib/hash'
 import { verifyVisitorCookie, signLookupToken, verifyLookupToken } from '@/lib/identity'
+import { Profile, mergeProfiles } from '@/lib/profile'
 
 const ORTHOGONAL_URL = 'https://api.orthogonal.com/v1/run'
 const RATE_LIMIT = 5 // per-visitor (signed cookie) successful lookups / 24h
@@ -65,7 +66,7 @@ async function callOrthogonal(
   params: Record<string, unknown>,
   httpMethod: 'GET' | 'POST' = 'POST',
   timeoutMs: number = TIER1_TIMEOUT_MS
-): Promise<{ ok: boolean; notFound: boolean; data: unknown }> {
+): Promise<{ ok: boolean; responded: boolean; data: unknown }> {
   try {
     const res = await fetchWithTimeout(
       ORTHOGONAL_URL,
@@ -83,48 +84,23 @@ async function callOrthogonal(
       },
       timeoutMs
     )
-    // 404 = the provider has no record for this profile. That's a clean miss,
-    // not a system failure — and not a billable call — so surface it distinctly:
-    // the route counts it as "responded" (→ not_found, not a 502) but charges $0.
+    // `responded` = the provider gave us a definitive answer, so a miss is a real
+    // "not found" rather than an outage (it gates not_found vs a 502). A 404 means
+    // "no record for this profile": responded, but a clean miss — not ok (no data)
+    // and not billable ($0). Only a timeout / 5xx / network error is !responded.
     if (res.status === 404) {
-      return { ok: false, notFound: true, data: null }
+      return { ok: false, responded: true, data: null }
     }
     if (!res.ok) {
       console.error(`[orthogonal] ${api}${path} → HTTP ${res.status}`)
-      return { ok: false, notFound: false, data: null }
+      return { ok: false, responded: false, data: null }
     }
     const json = await res.json()
-    return { ok: true, notFound: false, data: (json as { data?: unknown })?.data ?? json }
+    return { ok: true, responded: true, data: (json as { data?: unknown })?.data ?? json }
   } catch (err) {
     console.error(`[orthogonal] ${api}${path} → ${(err as Error).name}`)
-    return { ok: false, notFound: false, data: null }
+    return { ok: false, responded: false, data: null }
   }
-}
-
-interface Profile {
-  name?: string
-  title?: string
-  headline?: string
-  location?: string
-  company?: string
-  companyLogo?: string
-  companySize?: string
-  companyIndustry?: string
-  photoUrl?: string
-}
-
-// Merge partial profiles in priority order: the first provider with a value for
-// a given field wins. Lets Apollo supply the photo while Ocean fills the company
-// card and Bytemine backfills anything still missing.
-function mergeProfiles(...parts: Array<Profile | undefined>): Profile | undefined {
-  const merged: Profile = {}
-  for (const p of parts) {
-    if (!p) continue
-    for (const k of Object.keys(p) as (keyof Profile)[]) {
-      if (merged[k] === undefined && p[k] !== undefined) merged[k] = p[k]
-    }
-  }
-  return Object.keys(merged).length ? merged : undefined
 }
 
 // Ocean.io takes the bare profile handle (slug), not the full URL. Batch
@@ -133,7 +109,7 @@ async function tryOcean(
   handle: string,
   timeoutMs: number
 ): Promise<{ ok: boolean; responded: boolean; email: string | null; profile?: Profile }> {
-  const { ok, notFound, data } = await callOrthogonal(
+  const { ok, responded, data } = await callOrthogonal(
     'ocean-io',
     '/v2/lookup/people',
     {
@@ -143,7 +119,6 @@ async function tryOcean(
     'POST',
     timeoutMs
   )
-  const responded = ok || notFound
   const person = (data as { people?: Array<Record<string, unknown>> } | null)?.people?.[0]
   if (!person) return { ok, responded, email: null }
 
@@ -173,14 +148,13 @@ async function tryAviato(
   linkedinUrl: string,
   timeoutMs: number
 ): Promise<{ ok: boolean; responded: boolean; emails: string[] }> {
-  const { ok, notFound, data } = await callOrthogonal(
+  const { ok, responded, data } = await callOrthogonal(
     'aviato',
     '/person/contact-info',
     { linkedinURL: linkedinUrl },
     'GET',
     timeoutMs
   )
-  const responded = ok || notFound
   const list = (data as { emails?: Array<{ email?: string; type?: string }> } | null)?.emails
   if (!Array.isArray(list)) return { ok, responded, emails: [] }
   const work = list.filter((e) => e.type === 'work').map((e) => e.email)
@@ -199,14 +173,13 @@ async function tryApollo(
   verified: boolean
   profile?: Profile
 }> {
-  const { ok, notFound, data } = await callOrthogonal(
+  const { ok, responded, data } = await callOrthogonal(
     'apollo',
     '/api/v1/people/match',
     { linkedin_url: linkedinUrl, reveal_personal_emails: true },
     'POST',
     timeoutMs
   )
-  const responded = ok || notFound
   const person = (data as { person?: Record<string, unknown> } | null)?.person
   if (!person) return { ok, responded, email: null, personalEmails: [], verified: false }
 
@@ -246,14 +219,13 @@ async function tryContactOut(
   linkedinUrl: string,
   timeoutMs: number
 ): Promise<{ ok: boolean; responded: boolean; emails: string[] }> {
-  const { ok, notFound, data } = await callOrthogonal(
+  const { ok, responded, data } = await callOrthogonal(
     'contactout',
     '/v1/people/linkedin',
     { profile: linkedinUrl },
     'GET',
     timeoutMs
   )
-  const responded = ok || notFound
   const p = (data as { profile?: { work_email?: string[]; email?: string[] } } | null)?.profile
   if (!p) return { ok, responded, emails: [] }
   // Work emails first — this is a work-email finder.
@@ -268,14 +240,13 @@ async function tryBytemine(
   linkedinUrl: string,
   timeoutMs: number
 ): Promise<{ ok: boolean; responded: boolean; emails: string[]; verified: boolean; profile?: Profile }> {
-  const { ok, notFound, data } = await callOrthogonal(
+  const { ok, responded, data } = await callOrthogonal(
     'bytemine',
     '/contacts/enrich',
     { linkedin: linkedinUrl },
     'POST',
     timeoutMs
   )
-  const responded = ok || notFound
   const d = data as Record<string, unknown> | null
   if (!d) return { ok, responded, emails: [], verified: false }
 
@@ -528,15 +499,33 @@ async function handleLookup(request: NextRequest) {
 
   // 6. Respond.
   if (emails.length > 0) {
-    // Only a successful lookup counts toward the per-visitor quota (3/day) —
-    // recorded here, in whichever phase actually found the email. Best-effort.
+    // Count this success against the per-visitor quota (RATE_LIMIT/day), in
+    // whichever phase found the email. Go through the SAME advisory-locked
+    // count+insert RPC as the IP bucket, not a bare insert: the phase-1 query is
+    // only a cheap fast-fail, so without serialization here concurrent winning
+    // lookups from one cookie could all pass that read and overshoot the cap.
     if (visitorIdentity) {
-      const { error } = await supabase.from('attempts').insert({ user_hash: visitorIdentity })
+      const { data: logged, error } = await supabase.rpc('check_and_log_attempt', {
+        p_identity: visitorIdentity,
+        p_limit: RATE_LIMIT,
+        p_window_hours: WINDOW_HOURS,
+      })
+      // -1 = the visitor raced past their quota while this lookup was in flight;
+      // honor the limit rather than hand out an uncounted free lookup. A bare RPC
+      // error stays best-effort — don't deny an already-paid-for result over a
+      // transient logging blip.
       if (error) console.error('[lookup] success log failed:', error.message)
+      else if (logged === -1) return NextResponse.json({ rate_limited: true }, { status: 429 })
     }
     return NextResponse.json({ emails, profile, verified })
   }
   if (phase < 2) {
+    // A phase-1 miss where NO provider even responded is an outage, not a "hard
+    // to find" — surface it as a 502 now instead of paying for the $0.33
+    // ContactOut tier and then masking the failure as not_found at phase 2.
+    if (!anyOk) {
+      return NextResponse.json({ error: 'server' }, { status: 502 })
+    }
     // No email yet — hand the client a fresh single-use token for the ContactOut
     // phase, and pass along any profile we gathered so it can accumulate.
     const { token: nextToken } = await signLookupToken(cleanUrl)
