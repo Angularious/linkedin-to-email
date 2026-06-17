@@ -409,7 +409,7 @@ export default function LinkedInForm() {
                   <span style={{ flex: 1 }}>
                     well, this one&apos;s a ghost.
                     <span style={{ display: 'block', fontSize: '14px', color: '#999', marginTop: '3px' }}>
-                      we pinged 5 providers and still came up empty —{' '}
+                      we searched 300M+ profiles across 5 providers and still came up empty —{' '}
                       <a href={ORTHOGONAL_CTA} target="_blank" rel="noopener noreferrer"
                         style={{ color: '#c0392b', textDecoration: 'underline', textDecorationStyle: 'wavy', textUnderlineOffset: '3px' }}>
                         sign up to dig deeper.
@@ -482,8 +482,8 @@ export default function LinkedInForm() {
                 well, this one&apos;s a ghost.
               </p>
               <p style={{ fontSize: '16px', color: '#999', lineHeight: 1.4, marginBottom: '24px' }}>
-                we pinged 5 providers and still came up empty. sign up to run deeper
-                searches of your own.
+                we searched 300M+ profiles across 5 providers and still came up empty. sign up to run
+                deeper searches of your own.
               </p>
               <a
                 href={ORTHOGONAL_CTA} target="_blank" rel="noopener noreferrer"
