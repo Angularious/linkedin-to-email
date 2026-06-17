@@ -14,17 +14,16 @@ const RATE_LIMIT = 3 // per-visitor (signed cookie) lookups / 24h
 const IP_RATE_LIMIT = 30
 const WINDOW_HOURS = 24
 
-// The lookup is split into 3 separate HTTP calls (phase 1: Ocean ∥ Aviato ∥
-// Apollo, phase 2: Bytemine, phase 3: ContactOut), the client driving each in
-// turn only on a miss. Each phase is its own serverless function with its own
-// 10s Vercel limit, so a slow provider no longer has to share one 10s window
-// with the others — the previous cramming was what aborted live calls. Within a
-// phase we still budget against a wall-clock deadline so we return clean JSON
-// instead of letting Vercel hard-kill the function at 10s.
+// The lookup is split into 2 separate HTTP calls (phase 1: Ocean ∥ Aviato ∥
+// Apollo ∥ Bytemine, phase 2: ContactOut), the client driving phase 2 only on a
+// miss. Each phase is its own serverless function with its own 10s Vercel limit,
+// so a slow provider no longer has to share one 10s window with the others — the
+// previous cramming was what aborted live calls. Within a phase we still budget
+// against a wall-clock deadline so we return clean JSON instead of letting Vercel
+// hard-kill the function at 10s.
 const PROVIDER_BUDGET_MS = 8500 // per-phase wall-clock for provider calls (<10s cap)
-const TIER1_TIMEOUT_MS = 8000 // phase 1: Ocean ∥ Aviato ∥ Apollo (parallel)
-const TIER2_TIMEOUT_MS = 8000 // phase 2: Bytemine
-const TIER3_TIMEOUT_MS = 8000 // phase 3: ContactOut
+const TIER1_TIMEOUT_MS = 8000 // phase 1: Ocean ∥ Aviato ∥ Apollo ∥ Bytemine
+const TIER2_TIMEOUT_MS = 8000 // phase 2: ContactOut
 
 // Cap the function at the Hobby maximum explicitly.
 export const maxDuration = 10
@@ -192,17 +191,30 @@ async function tryAviato(
 async function tryApollo(
   linkedinUrl: string,
   timeoutMs: number
-): Promise<{ ok: boolean; responded: boolean; email: string | null; verified: boolean; profile?: Profile }> {
+): Promise<{
+  ok: boolean
+  responded: boolean
+  email: string | null
+  personalEmails: string[]
+  verified: boolean
+  profile?: Profile
+}> {
   const { ok, notFound, data } = await callOrthogonal(
     'apollo',
     '/api/v1/people/match',
-    { linkedin_url: linkedinUrl, reveal_personal_emails: false },
+    { linkedin_url: linkedinUrl, reveal_personal_emails: true },
     'POST',
     timeoutMs
   )
   const responded = ok || notFound
   const person = (data as { person?: Record<string, unknown> } | null)?.person
-  if (!person) return { ok, responded, email: null, verified: false }
+  if (!person) return { ok, responded, email: null, personalEmails: [], verified: false }
+
+  // With reveal_personal_emails, Apollo returns personal addresses in a separate
+  // array (work email stays in `email`).
+  const personalEmails = Array.isArray(person.personal_emails)
+    ? (person.personal_emails as unknown[]).filter((e): e is string => typeof e === 'string')
+    : []
 
   const org = person.organization as { name?: string; logo_url?: string } | undefined
   const location =
@@ -223,6 +235,7 @@ async function tryApollo(
     ok,
     responded,
     email: (person.email as string) || null,
+    personalEmails,
     // Apollo tags each email: "verified" | "guessed" | "unavailable" | null.
     verified: (person.email_status as string) === 'verified',
     profile: profile.name || profile.title ? profile : undefined,
@@ -309,7 +322,7 @@ async function handleLookup(request: NextRequest) {
   if (!body) return NextResponse.json({ error: 'bad_request' }, { status: 400 })
 
   const { url, token, phase: rawPhase } = body as { url?: string; token?: string; phase?: number }
-  const phase = rawPhase === 2 ? 2 : rawPhase === 3 ? 3 : 1
+  const phase = rawPhase === 2 ? 2 : 1
   // Trust only platform-set values. The first X-Forwarded-For hop is
   // client-supplied and trivially spoofable, so never key the rate limit on it;
   // Vercel populates request.ip / x-real-ip from the real connection.
@@ -419,7 +432,7 @@ async function handleLookup(request: NextRequest) {
   //    burst of concurrent requests can't read the same pre-spend total and
   //    collectively blow the cap. Reconciled to the real amount below.
   const phaseCost =
-    phase === 1 ? COST.ocean + COST.aviato + COST.apollo : phase === 2 ? COST.bytemine : COST.contactout
+    phase === 1 ? COST.ocean + COST.aviato + COST.apollo + COST.bytemine : COST.contactout
   const { data: reservationId, error: resErr } = await supabase.rpc('reserve_spend', {
     p_window_hours: WINDOW_HOURS,
     p_budget_cents: DAILY_BUDGET_CENTS,
@@ -442,14 +455,17 @@ async function handleLookup(request: NextRequest) {
   let anyOk = false
 
   if (phase === 1) {
-    // Three cheap providers in parallel ($0.01 each). Apollo and Ocean also
-    // supply the profile card (Ocean takes the bare handle, the others the URL).
+    // Four providers in parallel: Ocean, Aviato, Apollo ($0.01 each) + Bytemine
+    // ($0.03). Running the strong, cheap-ish Bytemine here (rather than as a
+    // fallback) raises hit quality without paying for the $0.33 ContactOut tier.
+    // Apollo/Ocean/Bytemine also supply the profile card.
     const handle = cleanUrl.split('/in/')[1]
     const cap = Math.min(TIER1_TIMEOUT_MS, timeLeft())
-    const [oceanR, aviatoR, apolloR] = await Promise.all([
+    const [oceanR, aviatoR, apolloR, bmR] = await Promise.all([
       tryOcean(handle, cap),
       tryAviato(cleanUrl, cap),
       tryApollo(cleanUrl, cap),
+      tryBytemine(cleanUrl, cap),
     ])
     if (oceanR.ok) {
       spent += COST.ocean
@@ -463,30 +479,36 @@ async function handleLookup(request: NextRequest) {
       spent += COST.apollo
       providers.push('apollo')
     }
-    // "Responded" includes a clean 404 (no data) — only a true error (timeout /
-    // 5xx / network) leaves it false, which is what distinguishes not_found from
-    // a 502.
-    anyOk = oceanR.responded || aviatoR.responded || apolloR.responded
-    profile = mergeProfiles(apolloR.profile, oceanR.profile)
-    // Aviato lists work emails first, so keep its order ahead of the singletons.
-    emails = Array.from(
-      new Set([...aviatoR.emails, oceanR.email, apolloR.email].filter(Boolean) as string[])
-    )
-    // The badge applies only to the displayed email, and only Apollo vouches in
-    // this phase.
-    if (apolloR.verified && apolloR.email && emails[0] === apolloR.email) verified = true
-  } else if (phase === 2) {
-    const bm = await tryBytemine(cleanUrl, Math.min(TIER2_TIMEOUT_MS, timeLeft()))
-    if (bm.ok) {
+    if (bmR.ok) {
       spent += COST.bytemine
       providers.push('bytemine')
     }
-    anyOk = bm.responded
-    emails = bm.emails
-    profile = bm.profile
-    if (bm.verified && bm.emails[0]) verified = true
+    // "Responded" includes a clean 404 (no data) — only a true error (timeout /
+    // 5xx / network) leaves it false, which is what distinguishes not_found from
+    // a 502.
+    anyOk = oceanR.responded || aviatoR.responded || apolloR.responded || bmR.responded
+    profile = mergeProfiles(apolloR.profile, oceanR.profile, bmR.profile)
+    // Work addresses first (Aviato + Bytemine list work first), then the
+    // singletons and Apollo's personal emails.
+    emails = Array.from(
+      new Set(
+        [
+          ...aviatoR.emails,
+          ...bmR.emails,
+          oceanR.email,
+          apolloR.email,
+          ...apolloR.personalEmails,
+        ].filter(Boolean) as string[]
+      )
+    )
+    // The badge applies only to the displayed email — set it when that address is
+    // one Apollo (email_status) or Bytemine (SMTP check) vouched for.
+    const verifiedEmails = new Set<string>()
+    if (apolloR.verified && apolloR.email) verifiedEmails.add(apolloR.email)
+    if (bmR.verified && bmR.emails[0]) verifiedEmails.add(bmR.emails[0])
+    verified = emails.length > 0 && verifiedEmails.has(emails[0])
   } else {
-    const co = await tryContactOut(cleanUrl, Math.min(TIER3_TIMEOUT_MS, timeLeft()))
+    const co = await tryContactOut(cleanUrl, Math.min(TIER2_TIMEOUT_MS, timeLeft()))
     if (co.ok) {
       spent += COST.contactout
       providers.push('contactout')
@@ -514,13 +536,13 @@ async function handleLookup(request: NextRequest) {
     }
     return NextResponse.json({ emails, profile, verified })
   }
-  if (phase < 3) {
-    // No email yet — hand the client a fresh single-use token for the next tier,
-    // and pass along any profile we gathered so it can accumulate across phases.
+  if (phase < 2) {
+    // No email yet — hand the client a fresh single-use token for the ContactOut
+    // phase, and pass along any profile we gathered so it can accumulate.
     const { token: nextToken } = await signLookupToken(cleanUrl)
     return NextResponse.json({ continue: true, phase: phase + 1, token: nextToken, profile })
   }
-  // Phase 3 miss: distinguish a genuine "not found" from a provider failure.
+  // Phase 2 miss: distinguish a genuine "not found" from a provider failure.
   if (!anyOk) {
     return NextResponse.json({ error: 'server' }, { status: 502 })
   }
