@@ -258,7 +258,7 @@ export default function LinkedInForm() {
             </form>
 
             <p style={{ fontSize: '16px', color: '#aaa', textAlign: 'center' }}>
-              3 free lookups per day &nbsp;·&nbsp;{' '}
+              5 free lookups per day &nbsp;·&nbsp;{' '}
               <a
                 href={ORTHOGONAL_CTA}
                 target="_blank"
@@ -423,7 +423,7 @@ export default function LinkedInForm() {
                 <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
                   <Image src="/smiley.svg" width={40} height={32} alt="rate limited" style={{ flexShrink: 0 }} />
                   <span style={{ flex: 1 }}>
-                    3/3 searches used today. back tomorrow — or{' '}
+                    5/5 searches used today. back tomorrow — or{' '}
                     <a href={ORTHOGONAL_CTA} target="_blank" rel="noopener noreferrer"
                       style={{ color: '#c0392b', textDecoration: 'underline', textDecorationStyle: 'wavy', textUnderlineOffset: '3px' }}>
                       sign up for unlimited.
