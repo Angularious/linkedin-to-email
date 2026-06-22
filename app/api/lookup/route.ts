@@ -284,9 +284,10 @@ export async function POST(request: NextRequest) {
 }
 
 async function handleLookup(request: NextRequest) {
-  // Wall-clock start. This phase's provider timeouts are budgeted against it so
-  // the gating work already spent counts against the 10s function limit.
-  const t0 = Date.now()
+  // t0 is set just before provider calls (step 4) so the provider timeout budget
+  // isn't eaten by BotID + Supabase gating overhead. Declared here so TypeScript
+  // sees it in scope; assigned after gating completes.
+  let t0 = 0
   const timeLeft = () => PROVIDER_BUDGET_MS - (Date.now() - t0)
 
   const body = await request.json().catch(() => null)
@@ -417,7 +418,9 @@ async function handleLookup(request: NextRequest) {
     return NextResponse.json({ at_capacity: true }, { status: 503 })
   }
 
-  // 4. Run this phase's providers, each with (near) the full 10s function budget.
+  // 4. Run this phase's providers. Start the stopwatch NOW — after all gating —
+  //    so BotID + Supabase overhead doesn't eat into the provider time budget.
+  t0 = Date.now()
   let emails: string[] = []
   let profile: Profile | undefined
   let verified = false
