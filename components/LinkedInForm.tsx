@@ -106,13 +106,14 @@ export default function LinkedInForm() {
     setShowDropdown(false)
     setLoadingMsg('looking...')
 
-    // Phase 1 runs four providers in parallel and can take ~8s; nudge the copy at
-    // 2.5s so a slow-but-working lookup doesn't look stuck. Cleared once phase 1
-    // returns (advancing to phase 2 sets its own message below).
+    // Phase 1 runs three providers in parallel (plus a possible 4th, sequential,
+    // fallback) and can take ~8-16s; nudge the copy at 2.5s so a slow-but-working
+    // lookup doesn't look stuck. Cleared once phase 1 returns (advancing to phase
+    // 2 sets its own message below).
     const slowTimer = setTimeout(() => setLoadingMsg('checking deeper sources...'), 2500)
 
-    // The lookup runs as up to 2 sequential calls — phase 1 (Ocean/Aviato/Apollo/
-    // Bytemine in parallel), then ContactOut, the second fired only if phase 1
+    // The lookup runs as up to 2 sequential calls — phase 1 (Apollo/Tomba/
+    // Bytemine in parallel, Aviato only on a miss), then ContactOut, fired only if phase 1
     // misses. Each is its own request (its own 10s budget), carrying the single-use
     // token the prior phase issued. We accumulate profile data across phases.
     const PHASE_MSG: Record<number, string> = {

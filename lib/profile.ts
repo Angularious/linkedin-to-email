@@ -15,9 +15,9 @@ export interface Profile {
 }
 
 // Merge partial profiles in priority order: the first source with a value for a
-// given field wins. Lets Apollo supply the photo while Ocean fills the company
-// card and Bytemine backfills anything still missing. Returns undefined when
-// every part is empty.
+// given field wins. Lets Apollo supply the photo while Bytemine fills the
+// company card (industry/size) and Tomba backfills anything still missing.
+// Returns undefined when every part is empty.
 export function mergeProfiles(...parts: Array<Profile | undefined>): Profile | undefined {
   const merged: Profile = {}
   for (const p of parts) {

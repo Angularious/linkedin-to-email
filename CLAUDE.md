@@ -8,7 +8,12 @@ so abuse/cost protection matters.
 - Next.js 14 (App Router), deployed on Vercel
 - Supabase (Postgres) for rate limiting + spend tracking
 - Orthogonal REST API (`https://api.orthogonal.com/v1/run`) for the lookups.
-  Providers: Ocean.io, Aviato, Apollo, Bytemine (phase 1, parallel), ContactOut (phase 2).
+  Providers: Apollo, Tomba, Bytemine (phase 1, parallel, always), Aviato
+  (phase 1, only if those three all miss), ContactOut (phase 2).
+  (Ocean.io held an always-on 4th slot until it was dropped from the
+  Orthogonal marketplace, 2026-08. Tomba replaces it — data-driven choice,
+  see the pipeline section below — and Aviato, the weakest of the four, was
+  demoted to fallback-only in the same pass, 2026-08-31.)
 - Hand-drawn UI via rough.js + Indie Flower font (inline styles)
 
 ## Lookup pipeline (`app/api/lookup/route.ts` — phased)
@@ -17,11 +22,52 @@ The lookup is **2 separate HTTP calls** (`{ url, phase, token }`), the client
 invocation with its own 10s Vercel limit, so a slow provider doesn't have to
 share one 10s window — that cramming was aborting live calls. Per phase:
 - **Phase 1** — clean/validate URL → bot check + rate limit (the only quota
-  consumer) → reserve budget → **Ocean.io ∥ Aviato ∥ Apollo ∥ Bytemine** in
-  parallel (~$0.06, ~8s). Apollo/Ocean/Bytemine also return the profile card.
-  Bytemine runs here (not as a fallback) to raise hit quality cheaply. Hit → done.
+  consumer) → reserve budget → **Apollo ∥ Tomba ∥ Bytemine** in parallel
+  (~$0.05, ~8s). Apollo/Bytemine also return the profile card. Bytemine runs
+  here (not as a fallback) to raise hit quality cheaply. If all three miss,
+  **Aviato** ($0.01) fires as one more cheap shot before falling through to
+  phase 2 — so the common case (one of the three strong providers hits) never
+  pays for it. Hit → done.
 - **Phase 2** — verify single-use token → reserve → **ContactOut** ($0.33),
-  the expensive last resort, only when phase 1 finds nothing.
+  the expensive last resort, only when phase 1 (incl. the Aviato fallback)
+  finds nothing.
+
+**Why Apollo+Tomba+Bytemine, not Aviato, anchor phase 1.** The
+`founder-email-waterfall` skill's 395-row audit of these same
+Orthogonal-wrapped providers found Apollo ~55% hit rate (100%
+verified-when-hit), Tomba ~27% (100% verified — Apollo+Tomba = ~82%
+combined), and Aviato only ~2% (just 25% of those verified, and it returns no
+profile-card fields at all — see `tryAviato`). That's founder LinkedIn URLs
+matched against a *known* company domain, not this route's arbitrary public
+input, so the percentages won't transfer exactly — but it's real usage of the
+same providers, and the ranking is a strong prior. Bytemine isn't in that
+audit (untested here); it stays on the strength of its SMTP-verified email +
+company-card fields.
+
+**Live-tested 2026-08-31** against 5 real profiles (2 recruiters, 2 banking
+MDs, 1 professor): Apollo+Tomba+Bytemine hit on 4/5, correctly demoting a
+personal gmail behind the real work email in the 2 cases that had both, and
+correctly ranking a `.edu` address above a personal ISP email. Also caught two
+real issues in the same pass, both fixed: `FREE_EMAIL_DOMAINS` was missing
+most non-"big-4" residential ISP domains (earthlink.net etc. — widened it),
+and Tomba's own `verification.status` field returned `"valid"` on a *stale,
+wrong* match (a different person's employer) — so it's never used as a
+verification signal here (`verifiedEmails` only trusts Apollo's
+`email_status` and Bytemine's SMTP check on its `work_email`, never `emails[0]`
+blindly, which used to risk mislabeling a personal fallback as
+SMTP-verified when no work email existed).
+
+**Primary-email ranking.** All candidate emails from every provider that ran
+are pooled and re-ranked ourselves — a real professional address (company
+domain, `.edu`, anything not a free consumer-webmail domain like gmail/yahoo/
+outlook) always sorts before a personal one for the displayed `emails[0]`,
+regardless of which provider found it first or how that provider tagged it
+internally (`FREE_EMAIL_DOMAINS` in the route file; providers' own work/
+personal labels are inconsistent enough that a `.edu` address could otherwise
+lose to a gmail.com one). Verified addresses break ties within a tier;
+provider-priority order is the final tiebreak. Nothing is dropped — a
+personal email that loses the primary slot still appears in the "more info"
+dropdown.
 
 On a miss, a phase returns `{ continue, phase, token, profile }`; the client
 redeems `token` on the next call and accumulates `profile` across phases. A hit
@@ -36,19 +82,21 @@ phase-1 miss where **no** provider responded is treated as an outage: the route
 returns 502 immediately rather than escalating to (and paying for) the ContactOut
 tier and then masking the failure as `not_found`.
 
-Worst-case cost ~$0.39 (phase 1 ~$0.06 + ContactOut $0.33); expected cost ~$0.06,
-since the four parallel phase-1 providers resolve most profiles before ContactOut
-is ever paid for. Full-miss wall-clock is up to ~2×10s, surfaced via a "checking
-deeper sources…" message.
+Worst-case cost ~$0.39 (phase 1 $0.05 + Aviato fallback $0.01 + ContactOut
+$0.33); typical-hit cost ~$0.05, since Apollo/Tomba/Bytemine resolve most
+profiles without ever reaching Aviato or ContactOut. Full-miss wall-clock is up
+to ~2×10s (phase 1's Aviato fallback runs inside its own 10s budget, after the
+three parallel calls), surfaced via a "checking deeper sources…" message.
 
 Provider response shapes are unwrapped from Orthogonal's `{ data: ... }` envelope.
-GET endpoints (Aviato, ContactOut) pass params as `query`; POST (Ocean, Apollo,
+GET endpoints (Aviato, ContactOut, Tomba) pass params as `query`; POST (Apollo,
 Bytemine) as `body`. Email shapes: Aviato `emails[].{email,type}` (work first),
-Ocean `people[0].email(.address)`, Bytemine flat `work_email`/`email`.
+Tomba's own envelope double-wraps as `data.data.email`, Bytemine flat
+`work_email`/`email`.
 
 ## Profile enrichment (free — same paid calls)
 The response also returns `profile` (merged field-by-field across providers via
-`mergeProfiles` — Apollo photo, Ocean company card, etc.) and a `verified` flag.
+`mergeProfiles` — Apollo photo, Bytemine company card, etc.) and a `verified` flag.
 `verified` is true only when the *displayed* email (`emails[0]`) carries a real
 deliverability signal — Apollo `email_status === 'verified'` or Bytemine
 `email_finder.smtp_result === 'valid'`/`confidence === 'high'` (both run in phase 1).

@@ -15,15 +15,16 @@ const RATE_LIMIT = 5 // per-visitor (signed cookie) successful lookups / 24h
 const IP_RATE_LIMIT = 30
 const WINDOW_HOURS = 24
 
-// The lookup is split into 2 separate HTTP calls (phase 1: Ocean ∥ Aviato ∥
-// Apollo ∥ Bytemine, phase 2: ContactOut), the client driving phase 2 only on a
-// miss. Each phase is its own serverless function with its own 10s Vercel limit,
-// so a slow provider no longer has to share one 10s window with the others — the
-// previous cramming was what aborted live calls. Within a phase we still budget
-// against a wall-clock deadline so we return clean JSON instead of letting Vercel
-// hard-kill the function at 10s.
+// The lookup is split into 2 separate HTTP calls (phase 1: Apollo ∥ Tomba ∥
+// Bytemine, +Aviato only on a miss; phase 2: ContactOut), the client driving
+// phase 2 only if phase 1 fully misses. Each phase is its own serverless
+// function with its own 10s Vercel limit, so a slow provider no longer has to
+// share one 10s window with the others — the previous cramming was what
+// aborted live calls. Within a phase we still budget against a wall-clock
+// deadline so we return clean JSON instead of letting Vercel hard-kill the
+// function at 10s.
 const PROVIDER_BUDGET_MS = 8500 // per-phase wall-clock for provider calls (<10s cap)
-const TIER1_TIMEOUT_MS = 8000 // phase 1: Ocean ∥ Aviato ∥ Apollo ∥ Bytemine
+const TIER1_TIMEOUT_MS = 8000 // phase 1: Apollo ∥ Tomba ∥ Bytemine, then Aviato if all three miss
 const TIER2_TIMEOUT_MS = 8000 // phase 2: ContactOut
 
 // Cap the function at the Hobby maximum explicitly.
@@ -35,16 +36,86 @@ export const maxDuration = 10
 const DAILY_BUDGET_CENTS = Number(process.env.DAILY_BUDGET_CENTS ?? 3000)
 
 // Per-provider cost in cents (Orthogonal charges on a successful HTTP call,
-// regardless of whether an email was found). Ocean bills ~$0.0045 in practice;
-// rounded up to 1¢ so the budget cap errs high. ContactOut is $0.33 without
-// phone (verified against the marketplace pricing formula).
-const COST = { ocean: 1, apollo: 1, aviato: 1, bytemine: 3, contactout: 33 }
+// regardless of whether an email was found). ContactOut is $0.33 without phone
+// (verified against the marketplace pricing formula). Tomba's $0.01 is
+// confirmed against the Orthogonal marketplace listing (flat price, not
+// dynamic) and against a live test call (2026-08-31) that returned real data
+// in the exact shape `tryTomba` parses — see that function.
+//
+// Provider choice is data-driven, not guessed: the founder-email-waterfall
+// skill's 395-row audit of these same Orthogonal-wrapped providers found
+// Apollo ~55% hit rate (100% verified-when-hit), Tomba ~27% (100% verified,
+// Apollo+Tomba = ~82% combined), Aviato ~2% (only 25% of those verified, and
+// it contributes no profile-card fields — see tryAviato). So Apollo+Tomba
+// anchor the always-on tier; Aviato is demoted to fallback-only. Ocean.io held
+// the 4th always-on slot until dropped from the marketplace (2026-08) — Tomba
+// replaces it, in the stronger role the audit data actually supports.
+//
+// Caveat on "100% verified": that's the waterfall skill's own acceptance rule
+// (domain matched a known company_website), not Tomba's self-reported
+// `verification.status` field. A live test here caught Tomba returning
+// `status: "valid"` on a stale match (wrong company, gmail address) — so this
+// route never treats that field as a verification signal (see verifiedEmails
+// below); the "100%" figure describes accepted matches, not raw hits.
+const COST = { apollo: 1, tomba: 1, aviato: 1, bytemine: 3, contactout: 33 }
 
 // Normalize any LinkedIn URL variant to https://www.linkedin.com/in/slug
 function cleanLinkedInUrl(input: string): string | null {
   const match = input.trim().match(/linkedin\.com\/in\/([a-zA-Z0-9_-]+)/i)
   if (!match) return null
   return `https://www.linkedin.com/in/${match[1]}`
+}
+
+// Free consumer webmail domains — anything NOT in this set (a company domain,
+// a .edu, a personal-but-vanity domain) counts as "professional" for ranking.
+// Providers' own work/personal tags are inconsistent (a .edu address sometimes
+// comes back untyped, or mistyped as personal), so we classify by domain
+// ourselves instead of trusting each provider's label.
+const FREE_EMAIL_DOMAINS = new Set([
+  'gmail.com', 'googlemail.com', 'yahoo.com', 'yahoo.co.uk', 'ymail.com',
+  'rocketmail.com', 'hotmail.com', 'hotmail.co.uk', 'outlook.com', 'live.com',
+  'msn.com', 'aol.com', 'aim.com', 'icloud.com', 'me.com', 'mac.com',
+  'protonmail.com', 'proton.me', 'fastmail.com', 'hushmail.com', 'gmx.com',
+  'gmx.net', 'mail.com', 'zoho.com', 'yandex.com', 'yandex.ru', 'mail.ru',
+  'qq.com', '163.com', '126.com', 'naver.com', 'rediffmail.com', 'web.de',
+  't-online.de', 'seznam.cz', 'wp.pl', 'o2.pl', 'orange.fr', 'free.fr',
+  'laposte.net', 'libero.it',
+  // Residential ISP webmail — same "not a workplace address" category as the
+  // big consumer brands above, just less common. Caught a real gap here: a
+  // .edu vs. earthlink.net test case only ranked correctly because a provider
+  // happened to tag the .edu address "verified" — this list should classify
+  // it correctly on its own, not rely on that being true every time.
+  'comcast.net', 'verizon.net', 'att.net', 'sbcglobal.net', 'earthlink.net',
+  'cox.net', 'charter.net', 'spectrum.net', 'centurylink.net', 'frontier.com',
+  'frontiernet.net', 'windstream.net', 'bellsouth.net', 'roadrunner.com',
+  'rr.com', 'embarqmail.com', 'netzero.net', 'juno.com', 'optonline.net',
+  'suddenlink.net', 'shaw.ca', 'sympatico.ca', 'rogers.com', 'telus.net',
+])
+
+function isPersonalDomain(email: string): boolean {
+  const domain = email.split('@')[1]?.toLowerCase() ?? ''
+  return FREE_EMAIL_DOMAINS.has(domain)
+}
+
+// Ranks candidate emails so a real professional address (company domain, .edu,
+// anything not free consumer webmail) always beats a personal one for the
+// primary slot, regardless of which provider returned it first. Verified
+// addresses break ties within a tier; original provider-priority order is the
+// final tiebreak. Personal addresses aren't dropped — they just sort after,
+// so they still show up in the "more info" dropdown.
+function rankEmails(candidates: string[], verifiedEmails: Set<string>): string[] {
+  return candidates
+    .map((email, i) => ({ email, i }))
+    .sort((a, b) => {
+      const aPersonal = isPersonalDomain(a.email)
+      const bPersonal = isPersonalDomain(b.email)
+      if (aPersonal !== bPersonal) return aPersonal ? 1 : -1
+      const aVerified = verifiedEmails.has(a.email)
+      const bVerified = verifiedEmails.has(b.email)
+      if (aVerified !== bVerified) return aVerified ? -1 : 1
+      return a.i - b.i
+    })
+    .map((x) => x.email)
 }
 
 async function fetchWithTimeout(url: string, opts: RequestInit, ms: number) {
@@ -103,47 +174,36 @@ async function callOrthogonal(
   }
 }
 
-// Ocean.io takes the bare profile handle (slug), not the full URL. Batch
-// endpoint: one handle in, people[0] out. Supplies a full profile incl. photo.
-async function tryOcean(
-  handle: string,
+// Tomba wants the full profile URL (unlike Ocean, which took a bare handle).
+// No photo/company-logo/size/industry in the response — Apollo and Bytemine
+// already cover those in mergeProfiles, so this only contributes name/title/
+// location/company plus its own independent shot at the email.
+async function tryTomba(
+  linkedinUrl: string,
   timeoutMs: number
 ): Promise<{ ok: boolean; responded: boolean; email: string | null; profile?: Profile }> {
   const { ok, responded, data } = await callOrthogonal(
-    'ocean-io',
-    '/v2/lookup/people',
-    {
-      linkedinHandles: [handle],
-      fields: ['name', 'jobTitle', 'headline', 'location', 'photo', 'email', 'email.address'],
-    },
-    'POST',
+    'tomba',
+    '/v1/linkedin',
+    { url: linkedinUrl },
+    'GET',
     timeoutMs
   )
-  const person = (data as { people?: Array<Record<string, unknown>> } | null)?.people?.[0]
+  const person = (data as { data?: Record<string, unknown> } | null)?.data
   if (!person) return { ok, responded, email: null }
 
-  // `email` may come back as a string or as an { address } object.
-  const emailField = person.email as { address?: string } | string | undefined
-  const email = (typeof emailField === 'string' ? emailField : emailField?.address) || null
-
-  const company = person.company as
-    | { name?: string; logo?: string; companySize?: string; industries?: string[] }
-    | undefined
+  const email = (person.email as string) || null
   const profile: Profile = {
-    name: (person.name as string) ?? undefined,
-    title: (person.jobTitle as string) ?? undefined,
-    headline: (person.headline as string) ?? undefined,
-    location: (person.location as string) ?? undefined,
-    company: company?.name ?? undefined,
-    companyLogo: company?.logo ?? undefined,
-    companySize: company?.companySize ?? undefined,
-    companyIndustry: company?.industries?.[0] ?? undefined,
-    photoUrl: (person.photo as string) ?? undefined,
+    name: (person.full_name as string) ?? undefined,
+    title: (person.position as string) ?? undefined,
+    location: (person.country as string) ?? undefined,
+    company: (person.company as string) ?? undefined,
   }
   return { ok, responded, email, profile: profile.name || profile.title ? profile : undefined }
 }
 
 // Aviato returns a typed email list; work emails are preferred (work finder).
+// Weakest of the four sources (see COST comment) — called fallback-only.
 async function tryAviato(
   linkedinUrl: string,
   timeoutMs: number
@@ -235,11 +295,18 @@ async function tryContactOut(
 }
 
 // Bytemine: cheap-ish ($0.03) mid-tier. Returns a verified work email plus
-// profile data (no photo), so it can also backfill the card if Ocean/Apollo miss.
+// profile data (no photo), so it can also backfill the card if Tomba/Apollo miss.
 async function tryBytemine(
   linkedinUrl: string,
   timeoutMs: number
-): Promise<{ ok: boolean; responded: boolean; emails: string[]; verified: boolean; profile?: Profile }> {
+): Promise<{
+  ok: boolean
+  responded: boolean
+  emails: string[]
+  verified: boolean
+  verifiedEmail: string | null
+  profile?: Profile
+}> {
   const { ok, responded, data } = await callOrthogonal(
     'bytemine',
     '/contacts/enrich',
@@ -248,15 +315,18 @@ async function tryBytemine(
     timeoutMs
   )
   const d = data as Record<string, unknown> | null
-  if (!d) return { ok, responded, emails: [], verified: false }
+  if (!d) return { ok, responded, emails: [], verified: false, verifiedEmail: null }
 
   const work = (d.work_email as string) || (d.email as string) || null
   const personal = (d.personal_email as string) || null
   const emails = Array.from(new Set([work, personal].filter(Boolean) as string[]))
 
-  // Bytemine runs an SMTP check on the work email and reports the result.
+  // Bytemine's SMTP check validates the WORK email specifically (see its own
+  // comment below) — `verified` must only ever point at `work`, never at
+  // `emails[0]`, which silently becomes the personal address whenever `work`
+  // is missing and would otherwise mislabel it as SMTP-verified.
   const ef = d.email_finder as { smtp_result?: string; confidence?: string } | undefined
-  const verified = ef?.smtp_result === 'valid' || ef?.confidence === 'high'
+  const verified = Boolean(work) && (ef?.smtp_result === 'valid' || ef?.confidence === 'high')
 
   const location =
     [d.person_city as string, d.person_state as string].filter(Boolean).join(', ') || undefined
@@ -269,7 +339,14 @@ async function tryBytemine(
     companyIndustry: (d.company_industry as string) ?? undefined,
     companySize: (d.company_employee_range as string) ?? undefined,
   }
-  return { ok, responded, emails, verified, profile: profile.name || profile.title ? profile : undefined }
+  return {
+    ok,
+    responded,
+    emails,
+    verified,
+    verifiedEmail: verified ? work : null,
+    profile: profile.name || profile.title ? profile : undefined,
+  }
 }
 
 export async function POST(request: NextRequest) {
@@ -404,7 +481,7 @@ async function handleLookup(request: NextRequest) {
   //    burst of concurrent requests can't read the same pre-spend total and
   //    collectively blow the cap. Reconciled to the real amount below.
   const phaseCost =
-    phase === 1 ? COST.ocean + COST.aviato + COST.apollo + COST.bytemine : COST.contactout
+    phase === 1 ? COST.tomba + COST.aviato + COST.apollo + COST.bytemine : COST.contactout
   const { data: reservationId, error: resErr } = await supabase.rpc('reserve_spend', {
     p_window_hours: WINDOW_HOURS,
     p_budget_cents: DAILY_BUDGET_CENTS,
@@ -429,29 +506,24 @@ async function handleLookup(request: NextRequest) {
   let anyOk = false
 
   if (phase === 1) {
-    // Four providers in parallel: Ocean, Aviato, Apollo ($0.01 each) + Bytemine
-    // ($0.03). Running the strong, cheap-ish Bytemine here (rather than as a
-    // fallback) raises hit quality without paying for the $0.33 ContactOut tier.
-    // Apollo/Ocean/Bytemine also supply the profile card.
-    const handle = cleanUrl.split('/in/')[1]
+    // Three providers in parallel: Apollo, Tomba ($0.01 each) + Bytemine
+    // ($0.03) — $0.05 flat. These are the two strongest email sources (see the
+    // COST comment above) plus the strong, cheap-ish Bytemine — run here
+    // (rather than as a fallback) to raise hit quality without paying for the
+    // $0.33 ContactOut tier. Apollo/Bytemine also supply the profile card.
     const cap = Math.min(TIER1_TIMEOUT_MS, timeLeft())
-    const [oceanR, aviatoR, apolloR, bmR] = await Promise.all([
-      tryOcean(handle, cap),
-      tryAviato(cleanUrl, cap),
+    const [apolloR, tombaR, bmR] = await Promise.all([
       tryApollo(cleanUrl, cap),
+      tryTomba(cleanUrl, cap),
       tryBytemine(cleanUrl, cap),
     ])
-    if (oceanR.ok) {
-      spent += COST.ocean
-      providers.push('ocean')
-    }
-    if (aviatoR.ok) {
-      spent += COST.aviato
-      providers.push('aviato')
-    }
     if (apolloR.ok) {
       spent += COST.apollo
       providers.push('apollo')
+    }
+    if (tombaR.ok) {
+      spent += COST.tomba
+      providers.push('tomba')
     }
     if (bmR.ok) {
       spent += COST.bytemine
@@ -460,26 +532,42 @@ async function handleLookup(request: NextRequest) {
     // "Responded" includes a clean 404 (no data) — only a true error (timeout /
     // 5xx / network) leaves it false, which is what distinguishes not_found from
     // a 502.
-    anyOk = oceanR.responded || aviatoR.responded || apolloR.responded || bmR.responded
-    profile = mergeProfiles(apolloR.profile, oceanR.profile, bmR.profile)
-    // Work addresses first (Aviato + Bytemine list work first), then the
-    // singletons and Apollo's personal emails.
-    emails = Array.from(
-      new Set(
-        [
-          ...aviatoR.emails,
-          ...bmR.emails,
-          oceanR.email,
-          apolloR.email,
-          ...apolloR.personalEmails,
-        ].filter(Boolean) as string[]
-      )
-    )
+    anyOk = apolloR.responded || tombaR.responded || bmR.responded
+    profile = mergeProfiles(apolloR.profile, tombaR.profile, bmR.profile)
+    let rawEmails = [
+      tombaR.email,
+      ...bmR.emails,
+      apolloR.email,
+      ...apolloR.personalEmails,
+    ].filter(Boolean) as string[]
     // The badge applies only to the displayed email — set it when that address is
-    // one Apollo (email_status) or Bytemine (SMTP check) vouched for.
+    // one Apollo (email_status) or Bytemine (SMTP check) vouched for. Tomba is
+    // deliberately never added here: a live test caught it reporting its own
+    // `verification.status: "valid"` on a stale/wrong match (see COST comment),
+    // so treating that field as a verification signal would be actively
+    // misleading, not just uninformative.
     const verifiedEmails = new Set<string>()
     if (apolloR.verified && apolloR.email) verifiedEmails.add(apolloR.email)
-    if (bmR.verified && bmR.emails[0]) verifiedEmails.add(bmR.emails[0])
+    if (bmR.verifiedEmail) verifiedEmails.add(bmR.verifiedEmail)
+
+    // Aviato is the weakest of the four (~2% hit rate, only 25% verified per
+    // the founder-email-waterfall audit) and supplies no profile fields at
+    // all, so it's a fallback-only last shot — it only fires when the three
+    // strong providers above found nothing, not an always-on 4th guess. Same
+    // outcome as before on a full miss (falls through to phase 2 either way),
+    // just cheaper on the common case.
+    if (rawEmails.length === 0) {
+      const aviatoCap = Math.min(TIER1_TIMEOUT_MS, timeLeft())
+      const aviatoR = await tryAviato(cleanUrl, aviatoCap)
+      if (aviatoR.ok) {
+        spent += COST.aviato
+        providers.push('aviato')
+      }
+      anyOk = anyOk || aviatoR.responded
+      rawEmails = aviatoR.emails
+    }
+
+    emails = rankEmails(Array.from(new Set(rawEmails)), verifiedEmails)
     verified = emails.length > 0 && verifiedEmails.has(emails[0])
   } else {
     const co = await tryContactOut(cleanUrl, Math.min(TIER2_TIMEOUT_MS, timeLeft()))
@@ -488,7 +576,9 @@ async function handleLookup(request: NextRequest) {
       providers.push('contactout')
     }
     anyOk = co.responded
-    emails = co.emails
+    // Same domain-quality ranking as phase 1 — ContactOut's own work/personal
+    // split has the same mislabeling risk (e.g. a .edu address).
+    emails = rankEmails(co.emails, new Set())
   }
 
   // 5. Reconcile the reservation to what we actually spent (0 if the provider
