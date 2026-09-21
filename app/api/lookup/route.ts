@@ -374,8 +374,9 @@ async function handleLookup(request: NextRequest) {
   const phase = rawPhase === 2 ? 2 : 1
   // Trust only platform-set values. The first X-Forwarded-For hop is
   // client-supplied and trivially spoofable, so never key the rate limit on it;
-  // Vercel populates request.ip / x-real-ip from the real connection.
-  const ip = request.ip ?? request.headers.get('x-real-ip') ?? 'unknown'
+  // Vercel populates x-real-ip from the real connection. (Next.js 15 dropped
+  // request.ip, which used to read the same value.)
+  const ip = request.headers.get('x-real-ip') ?? 'unknown'
 
   // 0. Reject cross-origin POSTs (all phases). Our UI always sends a same-origin
   //    request; a present, mismatched Origin is a direct/CSRF-style call.
